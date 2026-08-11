@@ -1,0 +1,22 @@
+[package]
+name = "ai-ssh-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow.workspace = true
+aissh-config = { path = "../../../crates/config" }
+aissh-protocol = { path = "../../../crates/protocol" }
+chrono.workspace = true
+serde.workspace = true
+tauri = { version = "2", features = ["tray-icon"] }
+tokio.workspace = true
+
+[[bin]]
+name = "ai-ssh-desktop"
+path = "src/main.rs"

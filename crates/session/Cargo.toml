@@ -1,0 +1,16 @@
+[package]
+name = "aissh-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+aissh-config = { path = "../config" }
+aissh-protocol = { path = "../protocol" }
+aissh-ssh = { path = "../ssh" }
+aissh-storage = { path = "../storage" }
+chrono.workspace = true
+tokio.workspace = true
+tokio-util = "0.7"
+uuid.workspace = true

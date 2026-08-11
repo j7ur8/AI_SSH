@@ -1,0 +1,13 @@
+[package]
+name = "aissh-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+rmp-serde.workspace = true
+serde.workspace = true
+serde_bytes = "0.11"
+thiserror.workspace = true
+tokio.workspace = true

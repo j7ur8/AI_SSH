@@ -1,0 +1,22 @@
+version = 1
+retention_days = 30
+idle_timeout_seconds = 1800
+connect_timeout_seconds = 15
+keepalive_seconds = 30
+recording_limit_mib = 500
+
+[[targets]]
+id = "development"
+name = "Development"
+host = "192.0.2.10"
+port = 22
+username = "developer"
+auth = { type = "private_key", path = "id_ed25519", passphrase = "replace-me" }
+
+# Password authentication is also supported. Credentials remain daemon-side:
+# [[targets]]
+# id = "lab"
+# name = "Lab"
+# host = "lab.internal"
+# username = "operator"
+# auth = { type = "password", password = "replace-me" }

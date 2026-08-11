@@ -1,0 +1,20 @@
+[package]
+name = "aisshd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+aissh-config = { path = "../../crates/config" }
+aissh-protocol = { path = "../../crates/protocol" }
+aissh-session = { path = "../../crates/session" }
+aissh-storage = { path = "../../crates/storage" }
+tokio.workspace = true
+libc = "0.2"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[[bin]]
+name = "aisshd"
+path = "src/main.rs"

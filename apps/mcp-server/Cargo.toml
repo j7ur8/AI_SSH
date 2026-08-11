@@ -1,0 +1,19 @@
+[package]
+name = "aissh-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+aissh-config = { path = "../../crates/config" }
+aissh-protocol = { path = "../../crates/protocol" }
+base64.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[[bin]]
+name = "aissh-mcp"
+path = "src/main.rs"

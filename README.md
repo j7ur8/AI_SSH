@@ -1,0 +1,54 @@
+# AI SSH
+
+AI SSH is a macOS-only local SSH session service. AI clients use the `aissh-mcp` stdio server; the MCP process delegates all connection ownership to `aisshd` over a same-user Unix socket. The Tauri menubar app observes active and historical sessions without sending terminal input.
+
+## Security model
+
+- Host-key verification is deliberately disabled. The accepted SHA256 fingerprint is recorded and displayed.
+- Passwords and private-key passphrases are plaintext in `~/.aissh/config.toml`; recordings are plaintext SQLite data.
+- `config.toml` and private keys must be mode `0600`; directories are mode `0700`. Keys outside `~/.aissh/keys` are rejected.
+- Login passwords are never returned through MCP and are never injected into `sudo` or other prompts.
+- The local socket is mode `0600` and the daemon additionally checks the peer UID.
+
+## Build and run
+
+Prerequisites are current stable Rust, Node.js 20+, Xcode command-line tools, and macOS 12+.
+
+```sh
+chmod +x scripts/install-local.sh
+./scripts/install-local.sh
+cd apps/desktop
+npm install
+npm run tauri dev
+```
+
+Edit `~/.aissh/config.toml` after installation. Keep its mode at `0600`; place private keys in `~/.aissh/keys` with mode `0600`.
+
+Configure an MCP client with the stable executable path:
+
+```json
+{
+  "mcpServers": {
+    "ai-ssh": {
+      "command": "/Users/YOUR_USER/.aissh/bin/aissh-mcp"
+    }
+  }
+}
+```
+
+Ordinary commands should use `ssh_exec_start` followed by `ssh_command_poll`. PTY tools are reserved for interactive prompts, persistent shell state, and full-screen terminal programs. A logical session permits only one exec or PTY at a time.
+
+## Workspace
+
+- `apps/daemon`: daemon, Unix socket server, lifecycle tasks
+- `apps/mcp-server`: MCP JSON-RPC stdio adapter
+- `apps/desktop`: Tauri 2 tray and React/xterm.js observer
+- `crates/protocol`: versioned MessagePack IPC contract
+- `crates/config`: versioned TOML and permission enforcement
+- `crates/ssh`: `russh` authentication, exec, and PTY channels
+- `crates/session`: concurrency, timeout, cancellation, and idle state
+- `crates/storage`: SQLite WAL history, retention, and recording caps
+
+## Release
+
+Local installation is automated. Distribution still requires project-specific Apple credentials: build both `aarch64-apple-darwin` and `x86_64-apple-darwin` binaries, combine helpers with `lipo`, configure the Tauri updater public key, then sign and notarize the `.app` with the owning Developer ID. Those identity-bound steps are intentionally not hard-coded.
