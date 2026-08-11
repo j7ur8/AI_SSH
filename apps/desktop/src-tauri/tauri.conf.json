@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "identifier": "com.aissh.menubar",
   "build": {
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build",
+    "beforeDevCommand": "npm run prepare:helpers && npm run dev",
+    "beforeBuildCommand": "npm run prepare:helpers && npm run build",
     "devUrl": "http://localhost:1420",
     "frontendDist": "../dist"
   },
@@ -14,5 +14,10 @@
     "windows": [{ "label": "main", "title": "AI SSH Sessions", "width": 1040, "height": 720, "visible": false }],
     "security": { "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src ipc: http://ipc.localhost" }
   },
-  "bundle": { "active": true, "targets": ["app"], "macOS": { "minimumSystemVersion": "12.0" } }
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "resources": ["binaries"],
+    "macOS": { "minimumSystemVersion": "12.0" }
+  }
 }

@@ -4,19 +4,7 @@ idle_timeout_seconds = 1800
 connect_timeout_seconds = 15
 keepalive_seconds = 30
 recording_limit_mib = 500
+quit_daemon_on_app_exit = false
+launch_at_login = false
 
-[[targets]]
-id = "development"
-name = "Development"
-host = "192.0.2.10"
-port = 22
-username = "developer"
-auth = { type = "private_key", path = "id_ed25519", passphrase = "replace-me" }
-
-# Password authentication is also supported. Credentials remain daemon-side:
-# [[targets]]
-# id = "lab"
-# name = "Lab"
-# host = "lab.internal"
-# username = "operator"
-# auth = { type = "password", password = "replace-me" }
+# Targets are created and edited in AI SSH.app.

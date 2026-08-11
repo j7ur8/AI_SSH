@@ -10,19 +10,31 @@ AI SSH is a macOS-only local SSH session service. AI clients use the `aissh-mcp`
 - Login passwords are never returned through MCP and are never injected into `sudo` or other prompts.
 - The local socket is mode `0600` and the daemon additionally checks the peer UID.
 
-## Build and run
+## Development
 
 Prerequisites are current stable Rust, Node.js 20+, Xcode command-line tools, and macOS 12+.
 
 ```sh
-chmod +x scripts/install-local.sh
-./scripts/install-local.sh
 cd apps/desktop
 npm install
 npm run tauri dev
 ```
 
-Edit `~/.aissh/config.toml` after installation. Keep its mode at `0600`; place private keys in `~/.aissh/keys` with mode `0600`.
+`npm run tauri dev` builds the daemon and MCP helpers, starts the desktop app, and adds the AI SSH icon to the macOS menu bar. If `aisshd` is not already running, approve the native startup dialog. The app creates `~/.aissh/config.toml` automatically and opens the configuration window when no targets exist.
+
+To build and open a standalone debug app:
+
+```sh
+cd apps/desktop
+npm run tauri build -- --debug
+open "../../target/debug/bundle/macos/AI SSH.app"
+```
+
+After the app is running, click the AI SSH icon in the macOS menu bar and choose **Open AI SSH**. Quitting the configuration window does not stop the menubar app; use **Quit Menubar** from its menu to exit it.
+
+Targets and credentials can be edited in the app's **Configuration** tab. Private keys must be placed in `~/.aissh/keys` with mode `0600`.
+
+The legacy `scripts/install-local.sh` command installs `aisshd` as a login LaunchAgent. It is not required for normal desktop development because the app installs and starts its bundled helper automatically.
 
 Configure an MCP client with the stable executable path:
 

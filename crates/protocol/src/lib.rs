@@ -151,6 +151,7 @@ pub enum Request {
         session_id: String,
     },
     ReloadConfig,
+    DaemonShutdown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,5 +270,18 @@ mod tests {
         let output: Response = read_frame(&mut server).await.unwrap();
         send.await.unwrap();
         assert_eq!(output.result.unwrap_err().code, "SESSION_BUSY");
+    }
+
+    #[tokio::test]
+    async fn daemon_shutdown_frame_round_trip() {
+        let input = RequestFrame {
+            request_id: 10,
+            request: Request::DaemonShutdown,
+        };
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let send = tokio::spawn(async move { write_frame(&mut client, &input).await.unwrap() });
+        let output: RequestFrame = read_frame(&mut server).await.unwrap();
+        send.await.unwrap();
+        assert!(matches!(output.request, Request::DaemonShutdown));
     }
 }

@@ -1,6 +1,7 @@
 /target
 /apps/desktop/node_modules
 /apps/desktop/dist
+/apps/desktop/src-tauri/binaries/*
+!/apps/desktop/src-tauri/binaries/.gitkeep
 .DS_Store
 *.log
-

@@ -8,6 +8,7 @@ use aissh_storage::Storage;
 use anyhow::{Context, Result};
 use std::{os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 #[tokio::main]
@@ -17,7 +18,7 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let paths = Paths::discover()?;
-    paths.ensure()?;
+    Config::ensure_exists(&paths)?;
     let config = Config::load(&paths).with_context(|| {
         format!(
             "cannot load {} (copy config.example.toml and chmod 600)",
@@ -35,6 +36,7 @@ async fn main() -> Result<()> {
     let listener = UnixListener::bind(&paths.socket)?;
     std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o600))?;
     info!(socket=%paths.socket.display(),"aisshd is ready");
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let reaper = Arc::clone(&manager);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -44,20 +46,34 @@ async fn main() -> Result<()> {
         }
     });
     loop {
-        let (stream, _) = listener.accept().await?;
-        match same_user(&stream) {
-            Ok(true) => {
-                let manager = Arc::clone(&manager);
-                tokio::spawn(async move {
-                    if let Err(error) = serve_client(stream, manager).await {
-                        warn!(%error,"IPC client disconnected");
-                    }
-                });
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_ok() && *shutdown_rx.borrow() {
+                    break;
+                }
             }
-            Ok(false) => warn!("rejected IPC connection from another UID"),
-            Err(error) => error!(%error,"cannot inspect IPC peer"),
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                match same_user(&stream) {
+                    Ok(true) => {
+                        let manager = Arc::clone(&manager);
+                        let shutdown = shutdown_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = serve_client(stream, manager, shutdown).await {
+                                warn!(%error,"IPC client disconnected");
+                            }
+                        });
+                    }
+                    Ok(false) => warn!("rejected IPC connection from another UID"),
+                    Err(error) => error!(%error,"cannot inspect IPC peer"),
+                }
+            }
         }
     }
+    drop(listener);
+    let _ = std::fs::remove_file(&paths.socket);
+    info!("aisshd stopped by local request");
+    Ok(())
 }
 
 fn same_user(stream: &UnixStream) -> Result<bool> {
@@ -65,7 +81,11 @@ fn same_user(stream: &UnixStream) -> Result<bool> {
     Ok(peer.uid() == unsafe { libc::geteuid() })
 }
 
-async fn serve_client(mut stream: UnixStream, manager: Arc<SessionManager>) -> Result<()> {
+async fn serve_client(
+    mut stream: UnixStream,
+    manager: Arc<SessionManager>,
+    shutdown: watch::Sender<bool>,
+) -> Result<()> {
     let mut client_name = String::from("unknown");
     loop {
         let frame: RequestFrame = match read_frame(&mut stream).await {
@@ -73,6 +93,7 @@ async fn serve_client(mut stream: UnixStream, manager: Arc<SessionManager>) -> R
             Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(error) => return Err(error.into()),
         };
+        let mut shutdown_requested = false;
         let result = match frame.request {
             Request::Handshake {
                 protocol_version,
@@ -164,6 +185,10 @@ async fn serve_client(mut stream: UnixStream, manager: Arc<SessionManager>) -> R
                 .await
                 .map(|_| ResponseData::Ack),
             Request::ReloadConfig => manager.reload_config().await.map(|_| ResponseData::Ack),
+            Request::DaemonShutdown => {
+                shutdown_requested = true;
+                Ok(ResponseData::Ack)
+            }
         };
         write_frame(
             &mut stream,
@@ -173,5 +198,9 @@ async fn serve_client(mut stream: UnixStream, manager: Arc<SessionManager>) -> R
             },
         )
         .await?;
+        if shutdown_requested {
+            let _ = shutdown.send(true);
+            return Ok(());
+        }
     }
 }
