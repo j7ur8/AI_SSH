@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 use tauri::{
-    Manager, WebviewUrl, WebviewWindowBuilder,
+    Emitter, Manager, WebviewUrl, WebviewWindowBuilder,
     menu::{IconMenuItem, Menu, NativeIcon, PredefinedMenuItem},
     tray::TrayIconBuilder,
 };
@@ -329,31 +329,10 @@ fn show_startup_error(app: tauri::AppHandle, message: impl Into<String>) {
         .show(move |_| exit_handle.exit(1));
 }
 
-fn open_session(app: &tauri::AppHandle, id: &str) {
-    let label = format!(
-        "session-{}",
-        id.replace(|c: char| !c.is_ascii_alphanumeric(), "-")
-    );
-    if let Some(window) = app.get_webview_window(&label) {
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
-        return;
-    }
-    let url = format!("index.html?session={id}");
-    let _ = WebviewWindowBuilder::new(app, &label, WebviewUrl::App(url.into()))
-        .title("AI SSH Session")
-        .inner_size(1040.0, 720.0)
-        .min_inner_size(720.0, 480.0)
-        .build();
-}
-
-#[tauri::command]
-fn show_session(app: tauri::AppHandle, session_id: String) {
-    open_session(&app, &session_id);
-}
-
 fn show_main_window(app: &tauri::AppHandle) -> AnyResult<()> {
+    #[cfg(target_os = "macos")]
+    app.set_activation_policy(tauri::ActivationPolicy::Regular)?;
+
     let window = if let Some(window) = app.get_webview_window("main") {
         window
     } else {
@@ -366,6 +345,12 @@ fn show_main_window(app: &tauri::AppHandle) -> AnyResult<()> {
     window.unminimize()?;
     window.show()?;
     window.set_focus()?;
+    Ok(())
+}
+
+fn show_session_in_main(app: &tauri::AppHandle, session_id: &str) -> AnyResult<()> {
+    show_main_window(app)?;
+    app.emit_to("main", "select-session", session_id)?;
     Ok(())
 }
 
@@ -419,7 +404,7 @@ fn initialize_ui(app: &tauri::AppHandle, paths: &Paths, created_config: bool) ->
     tray.on_menu_event(|app, event| {
         let id = event.id().as_ref();
         if let Some(session_id) = id.strip_prefix("session:") {
-            open_session(app, session_id)
+            let _ = show_session_in_main(app, session_id);
         } else if id == "history" {
             let _ = show_main_window(app);
         } else if id == "quit" {
@@ -580,6 +565,12 @@ fn main() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
+                #[cfg(target_os = "macos")]
+                if window.label() == "main" {
+                    let _ = window
+                        .app_handle()
+                        .set_activation_policy(tauri::ActivationPolicy::Accessory);
+                }
             }
         })
         .setup(|app| {
@@ -637,7 +628,6 @@ fn main() {
             sessions,
             session_status,
             session_events,
-            show_session,
             reload_config,
             config_get,
             config_save,

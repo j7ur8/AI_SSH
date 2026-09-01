@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import {
@@ -50,9 +51,25 @@ type Session = {
 };
 
 type TerminalEvent = {
+  command_id: string | null;
   sequence: number;
   stream: "stdout" | "stderr" | "pty" | "system";
+  timestamp: string;
   payload: number[];
+};
+
+type CommandStatus = "running" | "completed" | "failed" | "timed_out" | "cancelled";
+
+type SessionCommand = {
+  id: string;
+  session_id: string;
+  command: string;
+  status: CommandStatus;
+  exit_code: number | null;
+  started_at: string;
+  finished_at: string | null;
+  last_sequence: number;
+  recording_truncated: boolean;
 };
 
 type Auth =
@@ -86,16 +103,16 @@ type ResponseData =
   | {
       kind: "events";
       data: {
+        command?: SessionCommand | null;
+        commands?: SessionCommand[];
         events: TerminalEvent[];
         next_sequence: number;
         has_more: boolean;
       };
     };
 
-const sessionId = new URLSearchParams(location.search).get("session");
-
 function App() {
-  return sessionId ? <SessionWindow id={sessionId} /> : <Dashboard />;
+  return <Dashboard />;
 }
 
 function Dashboard() {
@@ -105,12 +122,16 @@ function Dashboard() {
   const [error, setError] = useState("");
   const [connectionError, setConnectionError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
 
   const loadSessions = async () => {
     try {
       const value = await invoke<ResponseData>("sessions", { includeHistory: true });
       if (value.kind === "sessions") {
         setSessions(value.data);
+        setSelectedSessionId((current) => current && value.data.some((item) => item.id === current)
+          ? current
+          : value.data[0]?.id ?? null);
         setConnectionError("");
       }
     } catch (cause) {
@@ -132,7 +153,16 @@ function Dashboard() {
     void loadSessions();
     void loadConfig();
     const timer = window.setInterval(loadSessions, 2000);
-    return () => window.clearInterval(timer);
+    let unlisten: (() => void) | undefined;
+    void listen<string>("select-session", (event) => {
+      setView("sessions");
+      setSelectedSessionId(event.payload);
+      void loadSessions();
+    }).then((stop) => { unlisten = stop; });
+    return () => {
+      window.clearInterval(timer);
+      unlisten?.();
+    };
   }, []);
 
   const testTarget = async (targetId: string) => {
@@ -165,7 +195,13 @@ function Dashboard() {
       </Header>
       {(error || connectionError) && <div className="error-banner">{error || connectionError}</div>}
       {view === "sessions" ? (
-        <SessionsView sessions={sessions} busy={busy} onRefresh={loadSessions} />
+        <SessionsView
+          sessions={sessions}
+          selectedSessionId={selectedSessionId}
+          busy={busy}
+          onSelect={setSelectedSessionId}
+          onRefresh={loadSessions}
+        />
       ) : config ? (
         <ConfigEditor
           initial={config}
@@ -186,64 +222,60 @@ function Dashboard() {
 
 function SessionsView({
   sessions,
+  selectedSessionId,
   busy,
+  onSelect,
   onRefresh,
 }: {
   sessions: Session[];
+  selectedSessionId: string | null;
   busy: boolean;
+  onSelect: (sessionId: string) => void;
   onRefresh: () => Promise<void>;
 }) {
+  const selected = sessions.find((item) => item.id === selectedSessionId) ?? null;
   return (
-    <section className="content">
-      <div className="section-title">
-        <div>
-          <h2>Sessions</h2>
-          <span>{sessions.length} recorded</span>
+    <section className="sessions-workspace">
+      <aside className="sessions-pane">
+        <div className="sessions-pane-header">
+          <div>
+            <h2>Sessions</h2>
+            <span>{sessions.length} recorded</span>
+          </div>
+          <button className="icon" title="Refresh sessions" onClick={() => void onRefresh()}>
+            <RefreshCw size={17} />
+          </button>
         </div>
-        <button className="icon" title="Refresh sessions" onClick={() => void onRefresh()}>
-          <RefreshCw size={17} />
-        </button>
-      </div>
-      <div className="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Target</th>
-              <th>Status</th>
-              <th>Current command</th>
-              <th>AI client</th>
-              <th>Started</th>
-              <th aria-label="Actions" />
-            </tr>
-          </thead>
-          <tbody>
-            {sessions.map((item) => (
-              <tr key={item.id}>
-                <td>
-                  <strong>{item.target_name}</strong>
-                  <small>{item.id.slice(0, 8)}</small>
-                </td>
-                <td><Status value={item.status} /></td>
-                <td className="command">{item.current_command || "-"}</td>
-                <td>{item.client_name}</td>
-                <td>{new Date(item.created_at).toLocaleString()}</td>
-                <td className="row-action">
-                  <button
-                    className="icon"
-                    title="Open read-only terminal"
-                    onClick={() => invoke("show_session", { sessionId: item.id })}
-                  >
-                    <Eye size={16} />
-                  </button>
-                </td>
-              </tr>
-            ))}
-            {!sessions.length && !busy && (
-              <tr><td colSpan={6} className="empty">No sessions recorded</td></tr>
-            )}
-          </tbody>
-        </table>
-      </div>
+        <div className="session-list-scroll">
+          {sessions.map((item) => (
+            <button
+              key={item.id}
+              className={`session-row ${item.id === selectedSessionId ? "active" : ""}`}
+              aria-pressed={item.id === selectedSessionId}
+              onClick={() => onSelect(item.id)}
+            >
+              <span className="session-row-heading">
+                <strong>{item.target_name}</strong>
+                <Status value={item.status} />
+              </span>
+              <code>{item.current_command || item.purpose || "No command"}</code>
+              <span className="session-row-meta">
+                <span>{item.client_name}</span>
+                <time>{new Date(item.created_at).toLocaleString()}</time>
+              </span>
+            </button>
+          ))}
+          {!sessions.length && !busy && <div className="session-list-empty">No sessions recorded</div>}
+        </div>
+      </aside>
+      {selected ? (
+        <SessionDetail key={selected.id} id={selected.id} />
+      ) : (
+        <section className="session-detail-empty">
+          <TerminalSquare size={24} />
+          <span>No session selected</span>
+        </section>
+      )}
     </section>
   );
 }
@@ -471,12 +503,124 @@ function SecretField({ label, value, shown, onToggle, onChange }: { label: strin
   return <label className="field secret-field"><span>{label}</span><div><input type={shown ? "text" : "password"} value={value} onChange={(event) => onChange(event.target.value)} /><button type="button" className="icon" title={shown ? "Hide secret" : "Show secret"} onClick={onToggle}>{shown ? <EyeOff size={16} /> : <Eye size={16} />}</button></div></label>;
 }
 
-function SessionWindow({ id }: { id: string }) {
+type TranscriptState = {
+  commands: Map<string, SessionCommand>;
+  activeCommandId: string | null;
+  finishedCommandIds: Set<string>;
+  previousExecByteWasCr: boolean;
+  atLineStart: boolean;
+  wroteOutput: boolean;
+};
+
+function compactCommand(value: string): string {
+  const clean = value
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return clean.length <= 240 ? clean : `${clean.slice(0, 237)}...`;
+}
+
+function execPayloadWithTerminalEol(payload: number[], previousWasCr: boolean) {
+  const output: number[] = [];
+  let wasCr = previousWasCr;
+  let atLineStart = false;
+  for (const byte of payload) {
+    if (byte === 0x0a && !wasCr) output.push(0x0d);
+    output.push(byte);
+    wasCr = byte === 0x0d;
+    atLineStart = byte === 0x0a;
+  }
+  return { payload: new Uint8Array(output), previousWasCr: wasCr, atLineStart };
+}
+
+function finishTranscriptCommand(term: Terminal, state: TranscriptState, force = false) {
+  const id = state.activeCommandId;
+  if (!id || state.finishedCommandIds.has(id)) return;
+  const command = state.commands.get(id);
+  if (!command || command.status === "running") {
+    if (!force) return;
+    if (!state.atLineStart) term.write("\r\n");
+  } else {
+    const label = command.status === "completed"
+      ? `exit ${command.exit_code ?? 0}`
+      : command.exit_code == null
+        ? command.status.replace("_", " ")
+        : `exit ${command.exit_code}`;
+    const color = command.status === "completed" ? "\x1b[90m" : "\x1b[31m";
+    if (!state.atLineStart) term.write("\r\n");
+    term.write(`${color}[${label}]\x1b[0m\r\n`);
+  }
+  state.finishedCommandIds.add(id);
+  state.activeCommandId = null;
+  state.previousExecByteWasCr = false;
+  state.atLineStart = true;
+  state.wroteOutput = true;
+}
+
+function beginTranscriptCommand(term: Terminal, state: TranscriptState, command: SessionCommand) {
+  if (state.activeCommandId === command.id || state.finishedCommandIds.has(command.id)) return;
+  if (state.activeCommandId) finishTranscriptCommand(term, state, true);
+  const prefix = state.wroteOutput ? (state.atLineStart ? "\r\n" : "\r\n\r\n") : "";
+  term.write(`${prefix}\x1b[1;32m$\x1b[0m ${compactCommand(command.command)}\r\n`);
+  state.activeCommandId = command.id;
+  state.previousExecByteWasCr = false;
+  state.atLineStart = true;
+  state.wroteOutput = true;
+}
+
+function appendTranscript(
+  term: Terminal,
+  state: TranscriptState,
+  commands: SessionCommand[],
+  events: TerminalEvent[],
+  hasMore: boolean,
+) {
+  for (const command of commands) state.commands.set(command.id, command);
+
+  for (const event of events) {
+    if (event.command_id) {
+      const command = state.commands.get(event.command_id);
+      if (command) beginTranscriptCommand(term, state, command);
+      const normalized = execPayloadWithTerminalEol(
+        event.payload,
+        state.previousExecByteWasCr,
+      );
+      term.write(normalized.payload);
+      state.previousExecByteWasCr = normalized.previousWasCr;
+      state.atLineStart = normalized.atLineStart;
+      state.wroteOutput = true;
+      continue;
+    }
+
+    if (state.activeCommandId) finishTranscriptCommand(term, state, true);
+    term.write(new Uint8Array(event.payload));
+    state.previousExecByteWasCr = false;
+    state.atLineStart = event.payload.at(-1) === 0x0a;
+    state.wroteOutput = true;
+  }
+
+  if (!events.length && commands.length) {
+    const latest = commands.reduce((left, right) =>
+      left.started_at > right.started_at ? left : right);
+    beginTranscriptCommand(term, state, latest);
+  }
+  if (!hasMore) finishTranscriptCommand(term, state);
+}
+
+function SessionDetail({ id }: { id: string }) {
   const [session, setSession] = useState<Session | null>(null);
   const [error, setError] = useState("");
   const host = useRef<HTMLDivElement>(null);
   const terminal = useRef<Terminal | null>(null);
   const sequence = useRef(0);
+  const transcript = useRef<TranscriptState>({
+    commands: new Map(),
+    activeCommandId: null,
+    finishedCommandIds: new Set(),
+    previousExecByteWasCr: false,
+    atLineStart: true,
+    wroteOutput: false,
+  });
 
   useEffect(() => {
     if (!host.current) return;
@@ -499,8 +643,14 @@ function SessionWindow({ id }: { id: string }) {
     fit.fit();
     terminal.current = term;
     const resize = () => fit.fit();
+    const observer = new ResizeObserver(resize);
+    observer.observe(host.current);
     window.addEventListener("resize", resize);
-    return () => { window.removeEventListener("resize", resize); term.dispose(); };
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", resize);
+      term.dispose();
+    };
   }, []);
 
   useEffect(() => {
@@ -513,8 +663,16 @@ function SessionWindow({ id }: { id: string }) {
         while (active && more) {
           const output = await invoke<ResponseData>("session_events", { sessionId: id, afterSequence: sequence.current, maxBytes: 65536 });
           if (output.kind !== "events") break;
+          if (terminal.current) {
+            appendTranscript(
+              terminal.current,
+              transcript.current,
+              output.data.commands ?? (output.data.command ? [output.data.command] : []),
+              output.data.events,
+              output.data.has_more,
+            );
+          }
           for (const event of output.data.events) {
-            terminal.current?.write(new Uint8Array(event.payload));
             sequence.current = Math.max(sequence.current, event.sequence);
           }
           more = output.data.has_more;
@@ -530,13 +688,18 @@ function SessionWindow({ id }: { id: string }) {
   }, [id]);
 
   return (
-    <main className="session-page">
-      <Header />
+    <section className="session-detail">
+      <div className="session-detail-header">
+        <div>
+          <span>Session detail</span>
+          <h2>{session?.target_name || "Loading session"}</h2>
+        </div>
+        {session && <Status value={session.status} />}
+      </div>
       <section className="session-meta">
-        <div><span className="label">Target</span><strong>{session?.target_name || "Connecting"}</strong></div>
         <div><span className="label">Session</span><code>{id}</code></div>
         <div><span className="label">AI client</span><span>{session?.client_name || "-"}</span></div>
-        <div><span className="label">Status / exit</span>{session && <Status value={session.status} />}<small>{session?.last_exit_code == null ? "Exit pending" : `Exit ${session.last_exit_code}`}</small></div>
+        <div><span className="label">Exit</span><span>{session?.last_exit_code == null ? "Pending" : session.last_exit_code}</span></div>
       </section>
       <div className="warning"><ShieldAlert size={16} /><span>{session?.recording_truncated ? "Recording limit reached; live output continues" : "Host verification is disabled"}</span><code>{session?.host_fingerprint || "Fingerprint pending"}</code></div>
       {error && <div className="error-banner">{error}</div>}
@@ -544,7 +707,7 @@ function SessionWindow({ id }: { id: string }) {
         <div className="terminal-bar"><span><TerminalSquare size={16} />Read-only terminal</span><code>{session?.current_command || "No foreground command"}</code></div>
         <div className="terminal" ref={host} />
       </section>
-    </main>
+    </section>
   );
 }
 
@@ -556,4 +719,4 @@ function Status({ value }: { value: SessionStatus }) {
   return <span className={`status status-${value}`}><i />{value.replace("_", " ")}</span>;
 }
 
-createRoot(document.getElementById("root")!).render(<React.StrictMode><App /></React.StrictMode>);
+createRoot(document.getElementById("root")!).render(<App />);

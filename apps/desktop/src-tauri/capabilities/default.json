@@ -2,6 +2,6 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Local read-only AI SSH observer windows",
-  "windows": ["main", "session-*"],
+  "windows": ["main"],
   "permissions": ["core:default"]
 }
