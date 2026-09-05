@@ -32,6 +32,7 @@ struct SessionRuntime {
     info: RwLock<SessionInfo>,
     connection: Mutex<Option<SshConnection>>,
     foreground: Mutex<Option<Foreground>>,
+    background: Mutex<HashMap<String, CancellationToken>>,
     sequence: AtomicU64,
     recording_truncated: AtomicBool,
     last_activity: StdMutex<Instant>,
@@ -134,6 +135,7 @@ impl SessionManager {
             info: RwLock::new(info.clone()),
             connection: Mutex::new(None),
             foreground: Mutex::new(None),
+            background: Mutex::new(HashMap::new()),
             sequence: AtomicU64::new(0),
             recording_truncated: AtomicBool::new(false),
             last_activity: StdMutex::new(Instant::now()),
@@ -174,10 +176,16 @@ impl SessionManager {
     }
 
     pub async fn status(&self, session_id: &str) -> ApiResult<SessionInfo> {
-        let runtime = self.runtime(session_id).await?;
-        let mut info = runtime.info.read().await.clone();
-        info.recording_truncated = runtime.recording_truncated.load(Ordering::Relaxed);
-        Ok(info)
+        let runtime = self.sessions.read().await.get(session_id).cloned();
+        if let Some(runtime) = runtime {
+            let mut info = runtime.info.read().await.clone();
+            info.recording_truncated = runtime.recording_truncated.load(Ordering::Relaxed);
+            return Ok(info);
+        }
+        self.storage
+            .session(session_id)
+            .map_err(internal)?
+            .ok_or_else(|| session_not_found(session_id))
     }
 
     pub async fn close(&self, session_id: &str) -> ApiResult<()> {
@@ -189,6 +197,9 @@ impl SessionManager {
                     let _ = writer.close().await;
                 }
             }
+        }
+        for (_, cancel) in runtime.background.lock().await.drain() {
+            cancel.cancel();
         }
         if let Some(connection) = runtime.connection.lock().await.take() {
             let _ = connection.disconnect().await;
@@ -209,6 +220,31 @@ impl SessionManager {
         env: BTreeMap<String, String>,
         timeout_seconds: Option<u64>,
     ) -> ApiResult<CommandInfo> {
+        self.start_exec(session_id, command, cwd, env, timeout_seconds, false)
+            .await
+    }
+
+    pub async fn exec_background(
+        self: &Arc<Self>,
+        session_id: &str,
+        command: &str,
+        cwd: Option<&str>,
+        env: BTreeMap<String, String>,
+        timeout_seconds: Option<u64>,
+    ) -> ApiResult<CommandInfo> {
+        self.start_exec(session_id, command, cwd, env, timeout_seconds, true)
+            .await
+    }
+
+    async fn start_exec(
+        self: &Arc<Self>,
+        session_id: &str,
+        command: &str,
+        cwd: Option<&str>,
+        env: BTreeMap<String, String>,
+        timeout_seconds: Option<u64>,
+        background: bool,
+    ) -> ApiResult<CommandInfo> {
         if command.trim().is_empty() {
             return Err(ErrorPayload::new(
                 "INVALID_ARGUMENT",
@@ -223,7 +259,7 @@ impl SessionManager {
         }
         let runtime = self.runtime(session_id).await?;
         let mut foreground = runtime.foreground.lock().await;
-        if foreground.is_some() {
+        if !background && foreground.is_some() {
             return Err(ErrorPayload::new(
                 "SESSION_BUSY",
                 "session already has a foreground exec or PTY",
@@ -256,13 +292,21 @@ impl SessionManager {
             .insert_command(&command_info)
             .map_err(internal)?;
         let cancel = CancellationToken::new();
-        *foreground = Some(Foreground::Exec {
-            command_id: command_info.id.clone(),
-            cancel: cancel.clone(),
-        });
+        if background {
+            runtime
+                .background
+                .lock()
+                .await
+                .insert(command_info.id.clone(), cancel.clone());
+        } else {
+            *foreground = Some(Foreground::Exec {
+                command_id: command_info.id.clone(),
+                cancel: cancel.clone(),
+            });
+        }
         drop(foreground);
         drop(connection);
-        {
+        if !background {
             let mut info = runtime.info.write().await;
             info.status = SessionStatus::ExecRunning;
             info.current_command = Some(command.into());
@@ -273,10 +317,19 @@ impl SessionManager {
         let manager = Arc::clone(self);
         let command_task = command_info.clone();
         let runtime_task = Arc::clone(&runtime);
-        let timeout = timeout_seconds.unwrap_or(300).clamp(1, 86400);
+        let timeout = timeout_seconds
+            .unwrap_or(if background { 86400 } else { 300 })
+            .clamp(1, 86400);
         tokio::spawn(async move {
             manager
-                .run_exec(runtime_task, command_task, channel, cancel, timeout)
+                .run_exec(
+                    runtime_task,
+                    command_task,
+                    channel,
+                    cancel,
+                    timeout,
+                    background,
+                )
                 .await;
         });
         Ok(command_info)
@@ -289,6 +342,7 @@ impl SessionManager {
         mut channel: aissh_ssh::ExecChannel,
         cancel: CancellationToken,
         timeout_seconds: u64,
+        background: bool,
     ) {
         let deadline = tokio::time::sleep(Duration::from_secs(timeout_seconds));
         tokio::pin!(deadline);
@@ -301,7 +355,8 @@ impl SessionManager {
                     Some(ChannelEvent::Data(data))=>self.record(&runtime,Some(&command.id),StreamKind::Stdout,data),
                     Some(ChannelEvent::ExtendedData(data))=>self.record(&runtime,Some(&command.id),StreamKind::Stderr,data),
                     Some(ChannelEvent::ExitStatus(code))=>exit=Some(code),
-                    Some(ChannelEvent::Eof)|None=>{command.status=if exit==Some(0){CommandStatus::Completed}else{CommandStatus::Failed};break;}
+                    Some(ChannelEvent::Eof)=>{},
+                    Some(ChannelEvent::Close)|None=>{command.status=command_status_from_exit(exit);break;}
                 }
             }
         }
@@ -312,18 +367,23 @@ impl SessionManager {
         if let Ok(mut value) = runtime.last_activity.lock() {
             *value = Instant::now();
         }
-        let mut foreground = runtime.foreground.lock().await;
-        if matches!(&*foreground,Some(Foreground::Exec{command_id,..}) if command_id==&command.id) {
-            *foreground = None;
-        }
-        drop(foreground);
-        let mut info = runtime.info.write().await;
-        if info.status != SessionStatus::Closed {
-            info.status = SessionStatus::Idle;
-            info.current_command = None;
-            info.last_exit_code = exit;
-            info.updated_at = Utc::now();
-            let _ = self.storage.upsert_session(&info);
+        if background {
+            runtime.background.lock().await.remove(&command.id);
+        } else {
+            let mut foreground = runtime.foreground.lock().await;
+            if matches!(&*foreground,Some(Foreground::Exec{command_id,..}) if command_id==&command.id)
+            {
+                *foreground = None;
+            }
+            drop(foreground);
+            let mut info = runtime.info.write().await;
+            if info.status != SessionStatus::Closed {
+                info.status = SessionStatus::Idle;
+                info.current_command = None;
+                info.last_exit_code = exit;
+                info.updated_at = Utc::now();
+                let _ = self.storage.upsert_session(&info);
+            }
         }
     }
 
@@ -332,7 +392,7 @@ impl SessionManager {
         command_id: &str,
         after: u64,
         max_bytes: usize,
-    ) -> ApiResult<(CommandInfo, Vec<TerminalEvent>, bool)> {
+    ) -> ApiResult<(CommandInfo, Vec<TerminalEvent>, bool, Vec<String>)> {
         let command = self
             .storage
             .command(command_id)
@@ -358,7 +418,17 @@ impl SessionManager {
                 Some(command_id),
             );
         }
-        Ok((command, events, more))
+        let mut warnings = Vec::new();
+        if command.recording_truncated {
+            warnings.push(
+                "command output exceeded the configured recording limit; earlier output may no longer be available"
+                    .into(),
+            );
+        }
+        if after == 0 && events.is_empty() && command.status != CommandStatus::Running {
+            warnings.push("command finished without producing stdout or stderr events".into());
+        }
+        Ok((command, events, more, warnings))
     }
 
     pub async fn command_cancel(&self, command_id: &str) -> ApiResult<()> {
@@ -373,6 +443,11 @@ impl SessionManager {
                     cancel.cancel();
                     return Ok(());
                 }
+            }
+            drop(foreground);
+            if let Some(cancel) = runtime.background.lock().await.get(command_id) {
+                cancel.cancel();
+                return Ok(());
             }
         }
         Err(ErrorPayload::new(
@@ -487,22 +562,49 @@ impl SessionManager {
         session_id: &str,
         after: u64,
         max_bytes: usize,
-    ) -> ApiResult<(Vec<TerminalEvent>, bool)> {
-        let runtime = self.runtime(session_id).await?;
+    ) -> ApiResult<(Vec<CommandInfo>, Vec<TerminalEvent>, bool)> {
+        let runtime = self.sessions.read().await.get(session_id).cloned();
+        if runtime.is_none()
+            && self
+                .storage
+                .session(session_id)
+                .map_err(internal)?
+                .is_none()
+        {
+            return Err(session_not_found(session_id));
+        }
         let limit = max_bytes.clamp(1, 1024 * 1024);
         let (mut events, mut more) = self
             .storage
             .events_for_session(session_id, after, limit)
             .map_err(internal)?;
-        append_live(
-            &mut events,
-            &mut more,
-            &runtime.live_events,
-            after,
-            limit,
-            None,
-        );
-        Ok((events, more))
+        if let Some(runtime) = runtime {
+            append_live(
+                &mut events,
+                &mut more,
+                &runtime.live_events,
+                after,
+                limit,
+                None,
+            );
+        }
+        let mut command_ids = events
+            .iter()
+            .filter_map(|event| event.command_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        if let Some(command) = self
+            .storage
+            .latest_command_for_session(session_id)
+            .map_err(internal)?
+        {
+            command_ids.insert(command.id);
+        }
+        let commands = command_ids
+            .into_iter()
+            .filter_map(|id| self.storage.command(&id).transpose())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(internal)?;
+        Ok((commands, events, more))
     }
 
     pub async fn reload_config(&self) -> ApiResult<()> {
@@ -523,7 +625,10 @@ impl SessionManager {
                 .lock()
                 .map(|v| v.elapsed())
                 .unwrap_or_default();
-            if elapsed >= timeout && runtime.foreground.lock().await.is_none() {
+            if elapsed >= timeout
+                && runtime.foreground.lock().await.is_none()
+                && runtime.background.lock().await.is_empty()
+            {
                 let id = runtime.info.read().await.id.clone();
                 let _ = self.close(&id).await;
             }
@@ -566,13 +671,20 @@ impl SessionManager {
         }
     }
     async fn runtime(&self, id: &str) -> ApiResult<Arc<SessionRuntime>> {
-        self.sessions.read().await.get(id).cloned().ok_or_else(|| {
-            ErrorPayload::new(
-                "SESSION_NOT_FOUND",
-                format!("session {id:?} does not exist"),
-            )
-        })
+        self.sessions
+            .read()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or_else(|| session_not_found(id))
     }
+}
+
+fn session_not_found(id: &str) -> ErrorPayload {
+    ErrorPayload::new(
+        "SESSION_NOT_FOUND",
+        format!("session {id:?} does not exist"),
+    )
 }
 
 fn internal(error: impl std::fmt::Display) -> ErrorPayload {
@@ -596,6 +708,12 @@ fn append_live(
     limit: usize,
     command_id: Option<&str>,
 ) {
+    // Persisted events are always the earlier part of the sequence. Appending
+    // live overflow while a database page remains would advance the cursor
+    // past unseen persisted events.
+    if *more {
+        return;
+    }
     let Ok(live) = live.lock() else { return };
     let mut size: usize = events.iter().map(|e| e.payload.len()).sum();
     for event in live.iter().filter(|e| {
@@ -620,23 +738,107 @@ fn clearly_interactive(command: &str) -> bool {
     }
 }
 
+fn command_status_from_exit(exit: Option<u32>) -> CommandStatus {
+    if exit == Some(0) {
+        CommandStatus::Completed
+    } else {
+        CommandStatus::Failed
+    }
+}
+
 pub fn events_response(
     command: Option<CommandInfo>,
+    commands: Vec<CommandInfo>,
     events: Vec<TerminalEvent>,
+    after: u64,
     more: bool,
+    warnings: Vec<String>,
 ) -> ResponseData {
-    let next_sequence = events.last().map(|e| e.sequence).unwrap_or(0);
+    let next_sequence = events.last().map(|e| e.sequence).unwrap_or(after);
+    let delivery_complete = command
+        .as_ref()
+        .is_some_and(|value| value.status != CommandStatus::Running && !more);
     ResponseData::Events {
         command,
+        commands,
         events,
         next_sequence,
         has_more: more,
+        delivery_complete,
+        warnings,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn traces_historical_session_without_a_runtime() {
+        let storage = Arc::new(Storage::open(std::path::Path::new(":memory:"), 1).unwrap());
+        let now = Utc::now();
+        storage
+            .upsert_session(&SessionInfo {
+                id: "historical-session".into(),
+                target_id: "target".into(),
+                target_name: "Target".into(),
+                purpose: "history test".into(),
+                client_name: "test client".into(),
+                status: SessionStatus::Interrupted,
+                current_command: None,
+                last_exit_code: None,
+                recording_truncated: false,
+                host_fingerprint: None,
+                created_at: now,
+                updated_at: now,
+                closed_at: Some(now),
+            })
+            .unwrap();
+        storage
+            .insert_command(&CommandInfo {
+                id: "historical-command".into(),
+                session_id: "historical-session".into(),
+                command: "printf history".into(),
+                status: CommandStatus::Completed,
+                exit_code: Some(0),
+                started_at: now,
+                finished_at: Some(now),
+                last_sequence: 1,
+                recording_truncated: false,
+            })
+            .unwrap();
+        let mut event = TerminalEvent {
+            session_id: "historical-session".into(),
+            command_id: Some("historical-command".into()),
+            sequence: 1,
+            timestamp: now,
+            stream: StreamKind::Stdout,
+            payload: b"history".to_vec(),
+            persisted: true,
+        };
+        storage.append_event(&mut event).unwrap();
+
+        let manager = SessionManager::new(
+            Config::default_config(),
+            Paths::under(std::path::PathBuf::from("/unused")),
+            storage,
+        );
+        let status = manager.status("historical-session").await.unwrap();
+        assert_eq!(status.status, SessionStatus::Interrupted);
+
+        let (commands, events, has_more) = manager
+            .shell_read("historical-session", 0, 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload, b"history");
+        assert!(!has_more);
+
+        let error = manager.status("missing-session").await.unwrap_err();
+        assert_eq!(error.code, "SESSION_NOT_FOUND");
+    }
+
     #[test]
     fn stable_error_code_is_preserved() {
         let error = classify_error("AUTH_FAILED: rejected");
@@ -646,5 +848,59 @@ mod tests {
     fn recognizes_explicit_full_screen_commands() {
         assert!(clearly_interactive("vim /etc/hosts"));
         assert!(!clearly_interactive("top -b -n 1"));
+    }
+    #[test]
+    fn maps_exit_status_only_after_channel_completion() {
+        assert_eq!(command_status_from_exit(Some(0)), CommandStatus::Completed);
+        assert_eq!(command_status_from_exit(Some(2)), CommandStatus::Failed);
+        assert_eq!(command_status_from_exit(None), CommandStatus::Failed);
+    }
+
+    #[test]
+    fn keeps_empty_page_cursor_and_marks_terminal_delivery_complete() {
+        let command = CommandInfo {
+            id: "c".into(),
+            session_id: "s".into(),
+            command: "true".into(),
+            status: CommandStatus::Completed,
+            exit_code: Some(0),
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            last_sequence: 41,
+            recording_truncated: false,
+        };
+        let response = events_response(
+            Some(command.clone()),
+            vec![command],
+            vec![],
+            41,
+            false,
+            vec![],
+        );
+        assert!(matches!(
+            response,
+            ResponseData::Events {
+                next_sequence: 41,
+                delivery_complete: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn does_not_mix_live_tail_into_an_incomplete_persisted_page() {
+        let mut events = vec![];
+        let mut more = true;
+        let live = StdMutex::new(VecDeque::from([TerminalEvent {
+            session_id: "s".into(),
+            command_id: Some("c".into()),
+            sequence: 3000,
+            timestamp: Utc::now(),
+            stream: StreamKind::Stdout,
+            payload: b"tail".to_vec(),
+            persisted: false,
+        }]));
+        append_live(&mut events, &mut more, &live, 0, 1024, Some("c"));
+        assert!(events.is_empty());
     }
 }

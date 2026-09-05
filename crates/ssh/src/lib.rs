@@ -36,11 +36,13 @@ pub enum ChannelEvent {
     ExtendedData(Vec<u8>),
     ExitStatus(u32),
     Eof,
+    Close,
 }
 pub struct ExecChannel(russh::Channel<client::Msg>);
 pub struct PtyReader(russh::ChannelReadHalf);
 pub struct PtyWriter(russh::ChannelWriteHalf<client::Msg>);
 
+const UTF8_LOCALE_PRELUDE: &str = "if command -v locale >/dev/null 2>&1; then _aissh_locale=$(locale -a 2>/dev/null | sed -n '/[Uu][Tt][Ff][-_.]*8$/p' | sed -n '1p'); if [ -n \"$_aissh_locale\" ]; then export LANG=\"$_aissh_locale\" LC_ALL=\"$_aissh_locale\"; fi; unset _aissh_locale; fi";
 impl SshConnection {
     pub async fn connect(
         target: &Target,
@@ -112,13 +114,39 @@ impl SshConnection {
         rows: u32,
         term: &str,
     ) -> Result<(PtyReader, PtyWriter)> {
+        let utf8_locale = self.remote_utf8_locale().await;
         let channel = self.handle.channel_open_session().await?;
+        if let Some(locale) = utf8_locale {
+            // OpenSSH commonly accepts LANG/LC_* through the environment request.
+            // Servers that do not accept them simply ignore these best-effort hints.
+            channel.set_env(false, "LANG", &locale).await?;
+            channel.set_env(false, "LC_ALL", &locale).await?;
+        }
         channel
-            .request_pty(true, term, cols, rows, 0, 0, &[])
+            .request_pty(true, term, cols, rows, 0, 0, &[(russh::Pty::IUTF8, 1)])
             .await?;
         channel.request_shell(true).await?;
         let (reader, writer) = channel.split();
         Ok((PtyReader(reader), PtyWriter(writer)))
+    }
+
+    async fn remote_utf8_locale(&self) -> Option<String> {
+        let mut channel = self.handle.channel_open_session().await.ok()?;
+        channel.exec(true, b"locale -a 2>/dev/null").await.ok()?;
+        let mut output = Vec::new();
+        while let Some(message) = channel.wait().await {
+            match message {
+                ChannelMsg::Data { data } => output.extend_from_slice(&data),
+                ChannelMsg::Eof | ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        String::from_utf8(output)
+            .ok()?
+            .lines()
+            .map(str::trim)
+            .find(|locale| is_utf8_locale(locale))
+            .map(str::to_owned)
     }
     pub async fn disconnect(&self) -> Result<()> {
         self.handle
@@ -139,7 +167,8 @@ impl ExecChannel {
                 ChannelMsg::ExitStatus { exit_status } => {
                     return Some(ChannelEvent::ExitStatus(exit_status));
                 }
-                ChannelMsg::Eof | ChannelMsg::Close => return Some(ChannelEvent::Eof),
+                ChannelMsg::Eof => return Some(ChannelEvent::Eof),
+                ChannelMsg::Close => return Some(ChannelEvent::Close),
                 _ => {}
             }
         }
@@ -209,12 +238,23 @@ pub fn build_command(
                 .join(" "),
         );
     }
-    parts.push(format!("exec {command}"));
+    if !env.contains_key("LANG") && !env.contains_key("LC_ALL") {
+        parts.push(UTF8_LOCALE_PRELUDE.into());
+    }
+    // Keep process replacement for cancellation, but let a real shell parse
+    // builtins and compound syntax such as `unset`, pipelines, and redirects.
+    // A non-login shell also avoids unexpectedly reloading profile proxies.
+    parts.push(format!("exec /bin/sh -c {}", shell_quote(command)));
     Ok(parts.join(" && "))
 }
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn is_utf8_locale(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    value.ends_with("utf-8") || value.ends_with("utf8") || value.ends_with("utf_8")
 }
 fn resolve_key_path(path: &PathBuf, paths: &Paths) -> PathBuf {
     if path.is_absolute() {
@@ -232,8 +272,41 @@ mod tests {
         let env = BTreeMap::from([("NAME".into(), "a'b".into())]);
         assert_eq!(
             build_command("printf ok", Some("/tmp/a b"), &env).unwrap(),
-            "cd '/tmp/a b' && export NAME='a'\\''b' && exec printf ok"
+            "cd '/tmp/a b' && export NAME='a'\\''b' && if command -v locale >/dev/null 2>&1; then _aissh_locale=$(locale -a 2>/dev/null | sed -n '/[Uu][Tt][Ff][-_.]*8$/p' | sed -n '1p'); if [ -n \"$_aissh_locale\" ]; then export LANG=\"$_aissh_locale\" LC_ALL=\"$_aissh_locale\"; fi; unset _aissh_locale; fi && exec /bin/sh -c 'printf ok'"
         );
+    }
+
+    #[test]
+    fn executes_shell_builtins_and_compound_commands() {
+        let env = BTreeMap::from([("LANG".into(), "C".into()), ("NAME".into(), "value".into())]);
+        let command = build_command(
+            "unset NAME; export RESULT=ok; printf '%s' \"$RESULT:${NAME-unset}\"",
+            None,
+            &env,
+        )
+        .unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"ok:unset");
+    }
+
+    #[test]
+    fn respects_explicit_locale_environment() {
+        let env = BTreeMap::from([("LANG".into(), "zh_CN.GBK".into())]);
+        let command = build_command("locale charmap", None, &env).unwrap();
+        assert!(!command.contains("_aissh_locale"));
+        assert!(command.contains("export LANG='zh_CN.GBK'"));
+    }
+
+    #[test]
+    fn recognizes_utf8_locale_names() {
+        assert!(is_utf8_locale("en_US.UTF-8"));
+        assert!(is_utf8_locale("C.utf8"));
+        assert!(!is_utf8_locale("zh_CN.GBK"));
     }
     #[test]
     fn rejects_invalid_env_name() {

@@ -5,8 +5,8 @@ use aissh_protocol::{
 };
 use aissh_session::{SessionManager, events_response};
 use aissh_storage::Storage;
-use anyhow::{Context, Result};
-use std::{os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
+use anyhow::{Context, Result, bail};
+use std::{os::unix::fs::PermissionsExt, path::Path, sync::Arc, time::Duration};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 use tracing::{error, info, warn};
@@ -25,15 +25,11 @@ async fn main() -> Result<()> {
             paths.config.display()
         )
     })?;
+    let listener = bind_listener(&paths.socket).await?;
     let storage = Arc::new(Storage::open(&paths.database, config.recording_limit_mib)?);
     storage.interrupt_unfinished()?;
     storage.cleanup(config.retention_days)?;
     let manager = SessionManager::new(config, paths.clone(), storage);
-    if paths.socket.exists() {
-        std::fs::remove_file(&paths.socket)
-            .with_context(|| format!("cannot remove stale socket {}", paths.socket.display()))?;
-    }
-    let listener = UnixListener::bind(&paths.socket)?;
     std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o600))?;
     info!(socket=%paths.socket.display(),"aisshd is ready");
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -74,6 +70,29 @@ async fn main() -> Result<()> {
     let _ = std::fs::remove_file(&paths.socket);
     info!("aisshd stopped by local request");
     Ok(())
+}
+
+async fn bind_listener(path: &Path) -> Result<UnixListener> {
+    if path.exists() {
+        match UnixStream::connect(path).await {
+            Ok(_) => bail!("aisshd is already running at {}", path.display()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                std::fs::remove_file(path)
+                    .with_context(|| format!("cannot remove stale socket {}", path.display()))?;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot inspect existing socket {}", path.display()));
+            }
+        }
+    }
+    UnixListener::bind(path)
+        .with_context(|| format!("cannot bind daemon socket {}", path.display()))
 }
 
 fn same_user(stream: &UnixStream) -> Result<bool> {
@@ -139,6 +158,16 @@ async fn serve_client(
                 .exec_start(&session_id, &command, cwd.as_deref(), env, timeout_seconds)
                 .await
                 .map(ResponseData::Command),
+            Request::ExecBackground {
+                session_id,
+                command,
+                cwd,
+                env,
+                timeout_seconds,
+            } => manager
+                .exec_background(&session_id, &command, cwd.as_deref(), env, timeout_seconds)
+                .await
+                .map(ResponseData::Command),
             Request::CommandPoll {
                 command_id,
                 after_sequence,
@@ -146,7 +175,16 @@ async fn serve_client(
             } => manager
                 .command_poll(&command_id, after_sequence, max_bytes)
                 .await
-                .map(|(command, events, more)| events_response(Some(command), events, more)),
+                .map(|(command, events, more, warnings)| {
+                    events_response(
+                        Some(command.clone()),
+                        vec![command],
+                        events,
+                        after_sequence,
+                        more,
+                        warnings,
+                    )
+                }),
             Request::CommandCancel { command_id } => manager
                 .command_cancel(&command_id)
                 .await
@@ -171,7 +209,9 @@ async fn serve_client(
             } => manager
                 .shell_read(&session_id, after_sequence, max_bytes)
                 .await
-                .map(|(events, more)| events_response(None, events, more)),
+                .map(|(commands, events, more)| {
+                    events_response(None, commands, events, after_sequence, more, Vec::new())
+                }),
             Request::ShellResize {
                 session_id,
                 cols,
@@ -202,5 +242,30 @@ async fn serve_client(
             let _ = shutdown.send(true);
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn refuses_to_replace_a_live_daemon_socket() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("aisshd-live-socket-{suffix}"));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("aisshd.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+
+        let error = bind_listener(&path).await.unwrap_err();
+        assert!(error.to_string().contains("already running"));
+
+        drop(listener);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&directory).unwrap();
     }
 }

@@ -48,7 +48,11 @@ Configure an MCP client with the stable executable path:
 }
 ```
 
-Ordinary commands should use `ssh_exec_start` followed by `ssh_command_poll`. PTY tools are reserved for interactive prompts, persistent shell state, and full-screen terminal programs. A logical session permits only one exec or PTY at a time.
+Ordinary commands should use `ssh_exec_start` followed by `ssh_command_poll`. The command runs through `/bin/sh -c`, so shell builtins, pipelines, redirections, and compound scripts are supported. PTY tools are reserved for interactive prompts, persistent shell state, and full-screen terminal programs. A logical session permits only one foreground exec or PTY at a time.
+
+Event sequence numbers are scoped to the session, not to an individual command. Start polling a new command with `after_sequence: 0`, then pass the returned `next_sequence` to the next call. Events are returned in ascending order. A terminal `command.status` means remote execution has ended, but paged output may remain; stop only when `poll_complete` is true. The response also includes `has_more`, `sequence_scope: "session"`, and explicit `warnings` for a completed command with no output or output truncated by the configured recording limit.
+
+Long-running non-interactive work can use `ssh_exec_background`. It returns the same command handle used by `ssh_command_poll` and `ssh_command_cancel`, does not occupy the session foreground, and defaults to a 24-hour timeout. Closing the session cancels its foreground and background commands.
 
 ## Workspace
 

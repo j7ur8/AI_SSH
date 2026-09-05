@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, io};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -119,6 +119,13 @@ pub enum Request {
         env: BTreeMap<String, String>,
         timeout_seconds: Option<u64>,
     },
+    ExecBackground {
+        session_id: String,
+        command: String,
+        cwd: Option<String>,
+        env: BTreeMap<String, String>,
+        timeout_seconds: Option<u64>,
+    },
     CommandPoll {
         command_id: String,
         after_sequence: u64,
@@ -167,9 +174,15 @@ pub enum ResponseData {
     Command(CommandInfo),
     Events {
         command: Option<CommandInfo>,
+        #[serde(default)]
+        commands: Vec<CommandInfo>,
         events: Vec<TerminalEvent>,
         next_sequence: u64,
         has_more: bool,
+        #[serde(default)]
+        delivery_complete: bool,
+        #[serde(default)]
+        warnings: Vec<String>,
     },
     Ack,
 }
@@ -283,5 +296,28 @@ mod tests {
         let output: RequestFrame = read_frame(&mut server).await.unwrap();
         send.await.unwrap();
         assert!(matches!(output.request, Request::DaemonShutdown));
+    }
+
+    #[test]
+    fn events_without_command_list_remain_compatible() {
+        let value = serde_json::json!({
+            "kind": "events",
+            "data": {
+                "command": null,
+                "events": [],
+                "next_sequence": 0,
+                "has_more": false
+            }
+        });
+        let response: ResponseData = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            response,
+            ResponseData::Events {
+                commands,
+                delivery_complete: false,
+                warnings,
+                ..
+            } if commands.is_empty() && warnings.is_empty()
+        ));
     }
 }

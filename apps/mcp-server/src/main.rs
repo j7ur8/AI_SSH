@@ -7,12 +7,21 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Map, Value, json};
 use std::{
     collections::BTreeMap,
+    collections::HashMap,
     sync::atomic::{AtomicU64, Ordering},
+    sync::{Mutex, OnceLock},
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+static TEXT_DECODERS: OnceLock<Mutex<HashMap<String, DecoderState>>> = OnceLock::new();
+
+#[derive(Default)]
+struct DecoderState {
+    last_sequence: u64,
+    pending: Vec<u8>,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -154,6 +163,13 @@ fn tool_request(name: &str, args: &Value) -> Result<Request> {
             env: env_map(args)?,
             timeout_seconds: args.get("timeout_seconds").and_then(Value::as_u64),
         },
+        "ssh_exec_background" => Request::ExecBackground {
+            session_id: string("session_id")?,
+            command: string("command")?,
+            cwd: optional_string(args, "cwd")?,
+            env: env_map(args)?,
+            timeout_seconds: args.get("timeout_seconds").and_then(Value::as_u64),
+        },
         "ssh_command_poll" => Request::CommandPoll {
             command_id: string("command_id")?,
             after_sequence: after(),
@@ -195,14 +211,100 @@ fn public_json(data: ResponseData) -> Value {
     match data {
         ResponseData::Events {
             command,
+            commands,
             events,
             next_sequence,
             has_more,
+            delivery_complete,
+            warnings,
         } => {
-            json!({"command":command,"events":events.into_iter().map(|event|json!({"session_id":event.session_id,"command_id":event.command_id,"sequence":event.sequence,"timestamp":event.timestamp,"stream":event.stream,"data_base64":BASE64.encode(&event.payload),"text":String::from_utf8_lossy(&event.payload),"persisted":event.persisted})).collect::<Vec<_>>(),"next_sequence":next_sequence,"has_more":has_more})
+            let command_id = command.as_ref().map(|value| value.id.as_str());
+            let event_values = events
+                .into_iter()
+                .map(|event| {
+                    let key = event
+                        .command_id
+                        .as_deref()
+                        .or(command_id)
+                        .map(|id| format!("command:{id}:{}", stream_name(&event.stream)))
+                        .unwrap_or_else(|| {
+                            format!(
+                                "session:{}:{}",
+                                event.session_id,
+                                stream_name(&event.stream)
+                            )
+                        });
+                    let text = decode_event_text(&key, event.sequence, &event.payload);
+                    json!({"session_id":event.session_id,"command_id":event.command_id,"sequence":event.sequence,"timestamp":event.timestamp,"stream":event.stream,"data_base64":BASE64.encode(&event.payload),"text":text,"persisted":event.persisted})
+                })
+                .collect::<Vec<_>>();
+            if delivery_complete {
+                if let Some(command) = &command {
+                    clear_decoders_for_command(&command.id);
+                }
+            }
+            if !has_more {
+                for value in &commands {
+                    if !matches!(value.status, aissh_protocol::CommandStatus::Running) {
+                        clear_decoders_for_command(&value.id);
+                    }
+                }
+            }
+            json!({"command":command,"commands":commands,"events":event_values,"next_sequence":next_sequence,"has_more":has_more,"poll_complete":delivery_complete,"sequence_scope":"session","warnings":warnings})
         }
         other => serde_json::to_value(other).unwrap_or_else(|_| json!({})),
     }
+}
+
+fn stream_name(stream: &aissh_protocol::StreamKind) -> &'static str {
+    match stream {
+        aissh_protocol::StreamKind::Stdout => "stdout",
+        aissh_protocol::StreamKind::Stderr => "stderr",
+        aissh_protocol::StreamKind::Pty => "pty",
+        aissh_protocol::StreamKind::System => "system",
+    }
+}
+
+fn decode_event_text(key: &str, sequence: u64, payload: &[u8]) -> String {
+    let decoders = TEXT_DECODERS.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut decoders) = decoders.lock() else {
+        return String::from_utf8_lossy(payload).into_owned();
+    };
+    let state = decoders.entry(key.to_owned()).or_default();
+    if sequence <= state.last_sequence {
+        state.pending.clear();
+    }
+    state.last_sequence = state.last_sequence.max(sequence);
+
+    let mut bytes = Vec::with_capacity(state.pending.len() + payload.len());
+    bytes.extend_from_slice(&state.pending);
+    bytes.extend_from_slice(payload);
+    match std::str::from_utf8(&bytes) {
+        Ok(text) => {
+            state.pending.clear();
+            text.to_owned()
+        }
+        Err(error) if error.error_len().is_none() => {
+            let valid = error.valid_up_to();
+            let text = String::from_utf8(bytes[..valid].to_vec()).unwrap_or_default();
+            state.pending = bytes[valid..].to_vec();
+            text
+        }
+        Err(_) => {
+            state.pending.clear();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    }
+}
+
+fn clear_decoders_for_command(command_id: &str) {
+    let Some(decoders) = TEXT_DECODERS.get() else {
+        return;
+    };
+    let Ok(mut decoders) = decoders.lock() else {
+        return;
+    };
+    decoders.retain(|key, _| !key.starts_with(&format!("command:{command_id}:")));
 }
 
 fn public_error(error: anyhow::Error) -> Value {
@@ -300,8 +402,13 @@ fn tools() -> Vec<Value> {
             json!({"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"string"},"cwd":{"type":"string"},"env":{"type":"object","additionalProperties":{"type":"string"}},"timeout_seconds":{"type":"integer","minimum":1,"maximum":86400}},"required":["session_id","command"],"additionalProperties":false}),
         ),
         tool(
+            "ssh_exec_background",
+            "Start a non-interactive background command without occupying the session foreground. Returns a command_id for ssh_command_poll and ssh_command_cancel; the default timeout is 24 hours.",
+            json!({"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"string"},"cwd":{"type":"string"},"env":{"type":"object","additionalProperties":{"type":"string"}},"timeout_seconds":{"type":"integer","minimum":1,"maximum":86400}},"required":["session_id","command"],"additionalProperties":false}),
+        ),
+        tool(
             "ssh_command_poll",
-            "Read stdout/stderr events after a sequence number and inspect command completion.",
+            "Read stdout/stderr events in ascending order after a session-scoped sequence number. Continue until poll_complete is true; command.status alone does not mean all paged output has been returned.",
             json!({"type":"object","properties":{"command_id":{"type":"string"},"after_sequence":{"type":"integer","minimum":0,"default":0},"max_bytes":{"type":"integer","minimum":1,"maximum":1048576,"default":65536}},"required":["command_id"],"additionalProperties":false}),
         ),
         tool(
@@ -355,7 +462,34 @@ mod tests {
     use super::*;
     #[test]
     fn tool_list_has_all_public_tools() {
-        assert_eq!(tools().len(), 13);
+        assert_eq!(tools().len(), 14);
+    }
+
+    #[test]
+    fn parses_background_exec_request() {
+        let request = tool_request(
+            "ssh_exec_background",
+            &json!({"session_id":"s","command":"sleep 1"}),
+        )
+        .unwrap();
+        assert!(matches!(request, Request::ExecBackground { .. }));
+    }
+
+    #[test]
+    fn event_json_exposes_the_polling_contract() {
+        let value = public_json(ResponseData::Events {
+            command: None,
+            commands: vec![],
+            events: vec![],
+            next_sequence: 41,
+            has_more: false,
+            delivery_complete: true,
+            warnings: vec!["no output".into()],
+        });
+        assert_eq!(value["next_sequence"], 41);
+        assert_eq!(value["sequence_scope"], "session");
+        assert_eq!(value["poll_complete"], true);
+        assert_eq!(value["warnings"][0], "no output");
     }
     #[test]
     fn credentials_are_not_in_target_tool() {
@@ -364,5 +498,18 @@ mod tests {
                 .unwrap()
                 .contains("password")
         );
+    }
+
+    #[test]
+    fn decodes_utf8_split_across_events() {
+        let key = "test:split-utf8";
+        if let Some(decoders) = TEXT_DECODERS.get() {
+            decoders.lock().unwrap().remove(key);
+        }
+        assert_eq!(decode_event_text(key, 1, &[0xe4]), "");
+        assert_eq!(decode_event_text(key, 2, &[0xb8, 0xad]), "中");
+        if let Some(decoders) = TEXT_DECODERS.get() {
+            decoders.lock().unwrap().remove(key);
+        }
     }
 }

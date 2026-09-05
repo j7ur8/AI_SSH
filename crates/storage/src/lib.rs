@@ -62,25 +62,19 @@ impl Storage {
     pub fn sessions(&self) -> Result<Vec<SessionInfo>, StorageError> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare("SELECT id,target_id,target_name,purpose,client_name,status,current_command,host_fingerprint,created_at,updated_at,closed_at,last_exit_code,recording_truncated FROM sessions ORDER BY created_at DESC")?;
-        let rows = stmt.query_map([], |row| {
-            let status: String = row.get(5)?;
-            Ok(SessionInfo {
-                id: row.get(0)?,
-                target_id: row.get(1)?,
-                target_name: row.get(2)?,
-                purpose: row.get(3)?,
-                client_name: row.get(4)?,
-                status: parse_enum(&status, SessionStatus::Failed),
-                current_command: row.get(6)?,
-                last_exit_code: row.get(11)?,
-                recording_truncated: row.get(12)?,
-                host_fingerprint: row.get(7)?,
-                created_at: parse_time(row.get(8)?),
-                updated_at: parse_time(row.get(9)?),
-                closed_at: row.get::<_, Option<String>>(10)?.map(parse_time),
-            })
-        })?;
+        let rows = stmt.query_map([], session_from_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn session(&self, id: &str) -> Result<Option<SessionInfo>, StorageError> {
+        self.conn()?
+            .query_row(
+                "SELECT id,target_id,target_name,purpose,client_name,status,current_command,host_fingerprint,created_at,updated_at,closed_at,last_exit_code,recording_truncated FROM sessions WHERE id=?1",
+                [id],
+                session_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn insert_command(&self, command: &CommandInfo) -> Result<(), StorageError> {
@@ -101,11 +95,20 @@ impl Storage {
 
     pub fn command(&self, id: &str) -> Result<Option<CommandInfo>, StorageError> {
         self.conn()?.query_row(
-            "SELECT id,session_id,command,status,exit_code,started_at,finished_at,last_sequence,recording_truncated FROM commands WHERE id=?1",[id],|row| {
-                let status:String=row.get(3)?;
-                Ok(CommandInfo{id:row.get(0)?,session_id:row.get(1)?,command:row.get(2)?,status:parse_enum(&status,CommandStatus::Failed),exit_code:row.get(4)?,
-                    started_at:parse_time(row.get(5)?),finished_at:row.get::<_,Option<String>>(6)?.map(parse_time),last_sequence:row.get(7)?,recording_truncated:row.get(8)?})
-            },
+            "SELECT id,session_id,command,status,exit_code,started_at,finished_at,last_sequence,recording_truncated FROM commands WHERE id=?1",
+            [id],
+            command_from_row,
+        ).optional().map_err(Into::into)
+    }
+
+    pub fn latest_command_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<CommandInfo>, StorageError> {
+        self.conn()?.query_row(
+            "SELECT id,session_id,command,status,exit_code,started_at,finished_at,last_sequence,recording_truncated FROM commands WHERE session_id=?1 ORDER BY started_at DESC LIMIT 1",
+            [session_id],
+            command_from_row,
         ).optional().map_err(Into::into)
     }
 
@@ -171,8 +174,12 @@ impl Storage {
         max_bytes: usize,
     ) -> Result<(Vec<TerminalEvent>, bool), StorageError> {
         let conn = self.conn()?;
+        // Fetch one row beyond the event-count cap so has_more remains truthful
+        // even when many small events fit below max_bytes.
+        const PAGE_EVENTS: usize = 2048;
         let sql = format!(
-            "SELECT session_id,command_id,sequence,timestamp,stream,payload FROM events WHERE {column}=?1 AND sequence>?2 ORDER BY sequence LIMIT 2048"
+            "SELECT session_id,command_id,sequence,timestamp,stream,payload FROM events WHERE {column}=?1 AND sequence>?2 ORDER BY sequence LIMIT {}",
+            PAGE_EVENTS + 1
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params![id, after], |row| {
@@ -190,7 +197,9 @@ impl Storage {
         let (mut result, mut size, mut more) = (Vec::new(), 0, false);
         for row in rows {
             let event = row?;
-            if !result.is_empty() && size + event.payload.len() > max_bytes {
+            if result.len() == PAGE_EVENTS
+                || (!result.is_empty() && size + event.payload.len() > max_bytes)
+            {
                 more = true;
                 break;
             }
@@ -225,6 +234,40 @@ fn parse_time(value: String) -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
+fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionInfo> {
+    let status: String = row.get(5)?;
+    Ok(SessionInfo {
+        id: row.get(0)?,
+        target_id: row.get(1)?,
+        target_name: row.get(2)?,
+        purpose: row.get(3)?,
+        client_name: row.get(4)?,
+        status: parse_enum(&status, SessionStatus::Failed),
+        current_command: row.get(6)?,
+        last_exit_code: row.get(11)?,
+        recording_truncated: row.get(12)?,
+        host_fingerprint: row.get(7)?,
+        created_at: parse_time(row.get(8)?),
+        updated_at: parse_time(row.get(9)?),
+        closed_at: row.get::<_, Option<String>>(10)?.map(parse_time),
+    })
+}
+
+fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandInfo> {
+    let status: String = row.get(3)?;
+    Ok(CommandInfo {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        command: row.get(2)?,
+        status: parse_enum(&status, CommandStatus::Failed),
+        exit_code: row.get(4)?,
+        started_at: parse_time(row.get(5)?),
+        finished_at: row.get::<_, Option<String>>(6)?.map(parse_time),
+        last_sequence: row.get(7)?,
+        recording_truncated: row.get(8)?,
+    })
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,target_id TEXT NOT NULL,target_name TEXT NOT NULL,purpose TEXT NOT NULL,client_name TEXT NOT NULL,status TEXT NOT NULL,current_command TEXT,host_fingerprint TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,closed_at TEXT);
 CREATE TABLE IF NOT EXISTS commands(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,command TEXT NOT NULL,status TEXT NOT NULL,exit_code INTEGER,started_at TEXT NOT NULL,finished_at TEXT,last_sequence INTEGER NOT NULL DEFAULT 0,recording_truncated INTEGER NOT NULL DEFAULT 0,recorded_bytes INTEGER NOT NULL DEFAULT 0);
@@ -256,6 +299,9 @@ mod tests {
             closed_at: None,
         };
         store.upsert_session(&session).unwrap();
+        let stored_session = store.session("s").unwrap().unwrap();
+        assert_eq!(stored_session.id, "s");
+        assert_eq!(stored_session.status, SessionStatus::Ready);
         let command = CommandInfo {
             id: "c".into(),
             session_id: "s".into(),
@@ -268,6 +314,10 @@ mod tests {
             recording_truncated: false,
         };
         store.insert_command(&command).unwrap();
+        assert_eq!(
+            store.latest_command_for_session("s").unwrap().unwrap().id,
+            "c"
+        );
         let mut event = TerminalEvent {
             session_id: "s".into(),
             command_id: Some("c".into()),
@@ -280,5 +330,64 @@ mod tests {
         store.append_event(&mut event).unwrap();
         assert!(!event.persisted);
         assert!(store.command("c").unwrap().unwrap().recording_truncated)
+    }
+
+    #[test]
+    fn reports_more_when_event_count_reaches_page_limit() {
+        let store = Storage::open(Path::new(":memory:"), 1).unwrap();
+        let now = Utc::now();
+        let session = SessionInfo {
+            id: "s".into(),
+            target_id: "t".into(),
+            target_name: "T".into(),
+            purpose: "p".into(),
+            client_name: "c".into(),
+            status: SessionStatus::Ready,
+            current_command: None,
+            last_exit_code: None,
+            recording_truncated: false,
+            host_fingerprint: None,
+            created_at: now,
+            updated_at: now,
+            closed_at: None,
+        };
+        store.upsert_session(&session).unwrap();
+        let command = CommandInfo {
+            id: "c".into(),
+            session_id: "s".into(),
+            command: "many-events".into(),
+            status: CommandStatus::Running,
+            exit_code: None,
+            started_at: now,
+            finished_at: None,
+            last_sequence: 0,
+            recording_truncated: false,
+        };
+        store.insert_command(&command).unwrap();
+        for sequence in 1..=2050 {
+            let mut event = TerminalEvent {
+                session_id: "s".into(),
+                command_id: Some("c".into()),
+                sequence,
+                timestamp: now,
+                stream: StreamKind::Stdout,
+                payload: vec![b'x'],
+                persisted: true,
+            };
+            store.append_event(&mut event).unwrap();
+        }
+
+        let (first, has_more) = store.events_for_command("c", 0, 64 * 1024).unwrap();
+        assert_eq!(first.len(), 2048);
+        assert!(has_more);
+        assert_eq!(first.first().unwrap().sequence, 1);
+        assert_eq!(first.last().unwrap().sequence, 2048);
+
+        let (second, has_more) = store
+            .events_for_command("c", first.last().unwrap().sequence, 64 * 1024)
+            .unwrap();
+        assert_eq!(second.len(), 2);
+        assert!(!has_more);
+        assert_eq!(second.last().unwrap().sequence, 2050);
     }
 }
