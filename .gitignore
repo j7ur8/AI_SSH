@@ -9,3 +9,17 @@
 /apps/desktop/latest.json
 .DS_Store
 *.log
+
+# Written by tauri-build on every build; the editor resolves the $schema
+# pointers in capabilities/ against it once a build has run.
+/apps/desktop/src-tauri/gen/schemas/
+
+# Never commit signing or key material. The updater key pair deliberately lives
+# outside the repository, and this keeps a stray copy from being committed.
+*.key
+*.pem
+*.p12
+ai-ssh-updater.key*
+
+# Local agent harness state.
+.zcode/
