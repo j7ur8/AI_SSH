@@ -138,5 +138,9 @@ jobs:
     permissions:
       contents: write
     uses: ./.github/workflows/release.yml
+    # A reusable workflow does not receive the caller's secrets unless they are
+    # explicitly passed; without this the release build sees an empty signing key
+    # and cannot produce an update archive.
+    secrets: inherit
     with:
       tag: ${{ needs.tag.outputs.tag }}
