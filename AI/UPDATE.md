@@ -5,6 +5,32 @@ Do not record secrets, real hosts, session identifiers, commands, or terminal ou
 
 # AI Documentation Updates
 
+## 2026-09-15 - First release, and two CI fixes it exposed
+
+### Project changes
+
+- Fixed the reusable-workflow call in `tag.yml`: a workflow invoked with `uses:` does not inherit the caller's secrets, so the release build saw an empty `TAURI_SIGNING_PRIVATE_KEY` and stopped before producing an update archive. It now passes `secrets: inherit`.
+- Fixed a regression from removing `src-tauri/binaries/.gitkeep`: `tauri-build` requires every `bundle.resources` path to exist at compile time, so a fresh checkout failed with "resource path `binaries` doesn't exist". `build.rs` now creates the directory, which keeps a bare `cargo build` working without shipping a placeholder inside the app.
+- `createUpdaterArtifacts` moved out of `tauri.conf.json` into the release workflow as a `--config` override, because enabling it in the base config made every local `tauri build` fail without the private signing key.
+- Added the MIT `LICENSE` file that `Cargo.toml` already declared.
+- The desktop crate gained `serde_json`, which `generate_context!` needs once a plugin carries configuration.
+
+### Verification
+
+- The repository was made public after scanning the full history for private keys, tokens, password values, public IPs and leaked paths; none were found.
+- Published v0.2.0 as a real release: universal `.app` zip with checksum, plus the `.app.tar.gz`, its `.sig` and `latest.json`.
+- Verified the published release the way an installed app sees it: the manifest fetched anonymously from `releases/latest/download/latest.json` returned 200, and the downloaded archive passed the updater schema and signature tests against the public key compiled into the app.
+- Confirmed `npm run tauri build` works locally without the signing key, and that the release override still produces the signed archive.
+- CI: the Rust and live-sshd integration jobs passed; the desktop job failure that exposed the missing resource directory is fixed.
+
+### Documentation updates
+
+- `README.md`: noted why local builds do not produce update artifacts.
+- `AI/ARCHITECTURE.md`, `AI/CODEBASE_ANALYSIS.md`, `AI/NAMING.md` and `AI/PROJECT_OVERVIEW.md`: checked; no structural or naming changes.
+
+---
+
+
 ## 2026-09-15 - Automatic updates
 
 ### Project changes

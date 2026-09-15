@@ -33,6 +33,8 @@ npm run tauri build -- --debug
 open "../../target/debug/bundle/macos/AI SSH.app"
 ```
 
+A local build produces the app but not the signed update archive. That is deliberate: enabling `createUpdaterArtifacts` in `tauri.conf.json` makes every `tauri build` require the private signing key, which only the release workflow holds. The release enables it with a `--config` override instead.
+
 After the app is running, click the AI SSH icon in the macOS menu bar and choose **Open AI SSH**. Quitting the configuration window does not stop the menubar app; use **Quit Menubar** from its menu to exit it.
 
 Targets and credentials can be edited in the app's **Configuration** tab. Private keys must be placed in `~/.aissh/keys` with mode `0600`.
