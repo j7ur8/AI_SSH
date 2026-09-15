@@ -17,3 +17,6 @@ tracing-subscriber.workspace = true
 [[bin]]
 name = "aissh-mcp"
 path = "src/main.rs"
+
+[dev-dependencies]
+chrono.workspace = true

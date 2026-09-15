@@ -18,6 +18,14 @@
     "active": true,
     "targets": ["app"],
     "resources": ["binaries"],
-    "macOS": { "minimumSystemVersion": "12.0" }
+    "macOS": { "minimumSystemVersion": "12.0" },
+    "icon": ["icons/128x128.png", "icons/32x32.png", "icons/64x64.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": ["https://github.com/j7ur8/AI_SSH/releases/latest/download/latest.json"],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEVEQTkxREY4MzI0MTg0RDkKUldUWmhFRXkrQjJwN1ZuZzhPbGZQSUNhSjY5TmVMcm5Qcm9GaENHWFVEdzVMeXZIT0lTZ2llcG0K"
+    }
   }
 }

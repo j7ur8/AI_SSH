@@ -16,7 +16,7 @@ The review covered the current dirty worktree, all 40 tracked files, 10 Rust/Typ
 | Rust format | Passed |
 | Rust workspace tests | 31 passed, 0 failed |
 | TypeScript and Vite production build | Passed; one chunk-size warning |
-| Installed MCP helper | 14 tools exposed; daemon connection succeeded |
+| Installed MCP helper | 21 tools exposed; daemon connection succeeded |
 | Credentials in target-list result | No password/passphrase field observed |
 | Malformed JSON | Correct JSON-RPC parse error `-32700` |
 | Unknown method | Correct JSON-RPC method error `-32601` |

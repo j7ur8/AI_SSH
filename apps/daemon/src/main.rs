@@ -172,23 +172,36 @@ async fn serve_client(
                 command_id,
                 after_sequence,
                 max_bytes,
+                wait_seconds,
             } => manager
-                .command_poll(&command_id, after_sequence, max_bytes)
+                .command_poll(&command_id, after_sequence, max_bytes, wait_seconds)
                 .await
-                .map(|(command, events, more, warnings)| {
+                .map(|page| {
+                    // `command` already carries the primary entry in full; a
+                    // second copy in `commands` would re-send the same object
+                    // (including the command text) on every single poll.
                     events_response(
-                        Some(command.clone()),
-                        vec![command],
-                        events,
+                        Some(page.command),
+                        Vec::new(),
+                        page.events,
                         after_sequence,
-                        more,
-                        warnings,
+                        page.more,
+                        page.warnings,
+                        page.progress,
                     )
                 }),
             Request::CommandCancel { command_id } => manager
                 .command_cancel(&command_id)
                 .await
                 .map(|_| ResponseData::Ack),
+            Request::CommandsList {
+                session_id,
+                include_finished,
+                limit,
+            } => manager
+                .commands(session_id.as_deref(), include_finished, limit)
+                .await
+                .map(ResponseData::Commands),
             Request::ShellOpen {
                 session_id,
                 cols,
@@ -206,11 +219,20 @@ async fn serve_client(
                 session_id,
                 after_sequence,
                 max_bytes,
+                wait_seconds,
             } => manager
-                .shell_read(&session_id, after_sequence, max_bytes)
+                .shell_read(&session_id, after_sequence, max_bytes, wait_seconds)
                 .await
-                .map(|(commands, events, more)| {
-                    events_response(None, commands, events, after_sequence, more, Vec::new())
+                .map(|page| {
+                    events_response(
+                        None,
+                        page.commands,
+                        page.events,
+                        after_sequence,
+                        page.more,
+                        Vec::new(),
+                        page.progress,
+                    )
                 }),
             Request::ShellResize {
                 session_id,
@@ -222,6 +244,90 @@ async fn serve_client(
                 .map(|_| ResponseData::Ack),
             Request::ShellClose { session_id } => manager
                 .shell_close(&session_id)
+                .await
+                .map(|_| ResponseData::Ack),
+            Request::FileStat {
+                session_id,
+                remote_path,
+                hash,
+            } => manager
+                .file_stat(&session_id, &remote_path, hash)
+                .await
+                .map(ResponseData::FileStat),
+            Request::FileRead {
+                session_id,
+                remote_path,
+                max_bytes,
+                sudo,
+            } => manager
+                .file_read(&session_id, &remote_path, max_bytes, sudo)
+                .await
+                .map(ResponseData::FileContent),
+            Request::FileWrite {
+                session_id,
+                remote_path,
+                data,
+                append,
+                create_dirs,
+                mode,
+                sudo,
+                if_changed,
+            } => manager
+                .file_write(
+                    &session_id,
+                    &remote_path,
+                    &data,
+                    append,
+                    create_dirs,
+                    mode,
+                    sudo,
+                    if_changed,
+                )
+                .await
+                .map(ResponseData::FileOutcome),
+            Request::FileUpload {
+                session_id,
+                local_path,
+                remote_path,
+                create_dirs,
+                mode,
+                verify,
+            } => manager
+                .file_upload(
+                    &session_id,
+                    &local_path,
+                    &remote_path,
+                    create_dirs,
+                    mode,
+                    verify,
+                )
+                .await
+                .map(ResponseData::FileOutcome),
+            Request::FileDownload {
+                session_id,
+                remote_path,
+                local_path,
+                overwrite,
+                create_dirs,
+                verify,
+            } => manager
+                .file_download(
+                    &session_id,
+                    &remote_path,
+                    &local_path,
+                    overwrite,
+                    create_dirs,
+                    verify,
+                )
+                .await
+                .map(ResponseData::FileOutcome),
+            Request::FileMkdir {
+                session_id,
+                remote_path,
+                parents,
+                mode,
+            } => manager
+                .file_mkdir(&session_id, &remote_path, parents, mode)
                 .await
                 .map(|_| ResponseData::Ack),
             Request::ReloadConfig => manager.reload_config().await.map(|_| ResponseData::Ack),

@@ -1,0 +1,139 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Read-only: this workflow never writes to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Hermetic checks that need no display, no bundler and no SSH server. The
+  # desktop crate is excluded because a Tauri build needs macOS or webkit2gtk;
+  # the `desktop` job covers it.
+  rust:
+    name: Rust checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+          rustc --version
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check the release version is consistent
+        run: scripts/bump-version.sh --check
+
+      - name: Run tests
+        run: cargo test --workspace --exclude ai-ssh-desktop --all-targets
+
+      - name: Build the helpers
+        run: cargo build --release -p aisshd -p aissh-mcp
+
+  # The daemon and MCP server talk to a real sshd here. This is the job that
+  # actually exercises SFTP transfers and remote digest verification, which unit
+  # tests cannot cover.
+  integration:
+    name: Integration against a live sshd
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Start a local SSH server
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+          sudo systemctl start ssh
+          ssh-keygen -q -t ed25519 -f "${RUNNER_TEMP}/id" -N '' -C aissh-ci
+          mkdir -p ~/.ssh
+          cat "${RUNNER_TEMP}/id.pub" >> ~/.ssh/authorized_keys
+          chmod 700 ~/.ssh
+          chmod 600 ~/.ssh/authorized_keys
+          sudo systemctl restart ssh
+          # Fail here rather than in a test if key auth is not usable.
+          for attempt in 1 2 3 4 5; do
+            if ssh -i "${RUNNER_TEMP}/id" -o StrictHostKeyChecking=no \
+                 -o UserKnownHostsFile=/dev/null -o BatchMode=yes \
+                 -o ConnectTimeout=5 "127.0.0.1" true; then
+              echo "key authentication works"; exit 0
+            fi
+            sleep 3
+          done
+          echo "could not authenticate to the local sshd" >&2
+          sudo journalctl -u ssh --no-pager | tail -50 >&2
+          exit 1
+
+      - name: Check the SFTP subsystem is available
+        run: |
+          ssh -i "${RUNNER_TEMP}/id" -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null -o BatchMode=yes 127.0.0.1 \
+            'command -v sha256sum && ls -l /usr/lib/openssh/sftp-server'
+
+      # The tests authenticate as the runner's own Unix user, which is the
+      # account the key was installed for above. USER is expanded by the shell
+      # rather than read from the workflow env context, which does not carry it.
+      - name: Live SFTP transfer tests
+        env:
+          AISSH_TEST_SSH_PORT: "22"
+          AISSH_TEST_SSH_KEY: ${{ runner.temp }}/id
+        run: |
+          export AISSH_TEST_SSH_USER="${USER}"
+          echo "authenticating as ${AISSH_TEST_SSH_USER}"
+          cargo test -p aissh-ssh --test sftp_live -- --ignored --test-threads=1
+
+      - name: Full-stack MCP end-to-end check
+        env:
+          AISSH_TEST_SSH_PORT: "22"
+          AISSH_TEST_SSH_KEY: ${{ runner.temp }}/id
+        run: |
+          export AISSH_TEST_SSH_USER="${USER}"
+          cargo build -p aisshd -p aissh-mcp
+          python3 scripts/e2e_mcp_check.py
+
+  desktop:
+    name: Desktop app
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Type-check and build the frontend
+        working-directory: apps/desktop
+        run: npm run build
+
+      - name: Test the native shell
+        run: cargo test -p ai-ssh-desktop

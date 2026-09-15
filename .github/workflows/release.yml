@@ -1,0 +1,360 @@
+name: Release
+
+# Builds the universal macOS app for a tag and publishes it as a GitHub Release.
+# Triggered by pushing a v* tag, by the tag workflow, or manually for an existing
+# tag. The app is unsigned: credential-bound signing and notarization are left to
+# whoever owns the Developer ID, as README explains.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish a release for (for example v0.2.0)"
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        description: "Tag to publish a release for"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Resolves the tag before anything else so every later job reads it from a job
+  # output, which is available in every context rather than only in step inputs.
+  resolve:
+    name: Resolve the tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - id: resolve
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -eu
+          tag="${INPUT_TAG:-${GITHUB_REF_NAME}}"
+          case "${tag}" in
+            v*) ;;
+            *) echo "expected a v* tag, got \"${tag}\"" >&2; exit 1 ;;
+          esac
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${tag}"
+
+  verify:
+    name: Verify the tag
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+
+      - name: Check the tag matches the declared version
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -eu
+          # A tag that disagrees with the sources would name artifacts it does
+          # not contain: the bundle version comes from tauri.conf.json.
+          declared=$(scripts/bump-version.sh --print)
+          if [ "${TAG}" != "v${declared}" ]; then
+            echo "tag ${TAG} does not match the declared version ${declared}" >&2
+            exit 1
+          fi
+          echo "${TAG} matches the declared version"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --workspace --exclude ai-ssh-desktop --all-targets
+
+  build:
+    name: Build the universal app
+    needs: [resolve, verify]
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      - name: Install the pinned toolchain and both macOS targets
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          rustc --version
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Require the update signing key
+        env:
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -eu
+          if [ -z "${SIGNING_KEY}" ]; then
+            cat >&2 <<'EOF'
+          TAURI_SIGNING_PRIVATE_KEY is not set, so this build cannot sign an
+          update archive. The release would publish an app that can never
+          auto-update, so it is stopped here instead.
+
+          Create a key pair and add both secrets:
+
+            scripts/generate-updater-key.sh
+            gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/ai-ssh-updater.key
+            gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD < ~/.tauri/ai-ssh-updater.key.password
+
+          The public half belongs in apps/desktop/src-tauri/tauri.conf.json.
+          EOF
+            exit 1
+          fi
+          echo "signing key is present"
+
+      - name: Build the app for both architectures
+        working-directory: apps/desktop
+        env:
+          # Stages one helper per architecture, because the helper installed into
+          # ~/.aissh/bin runs natively on the machine that installed it.
+          AISSH_HELPER_TARGET: universal-apple-darwin
+          # Signs the updater archive; the app refuses any archive whose
+          # signature does not match the public key in tauri.conf.json.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build -- --target universal-apple-darwin
+
+      - name: Verify the bundle contents
+        working-directory: apps/desktop
+        run: |
+          set -eu
+          app="../../target/universal-apple-darwin/release/bundle/macos/AI SSH.app"
+          test -d "${app}" || { echo "no app bundle at ${app}" >&2; exit 1; }
+
+          # Without the icns the bundle has no icon in Finder or the Dock.
+          test -f "${app}/Contents/Resources/icon.icns" ||
+            { echo "the bundle is missing icon.icns" >&2; exit 1; }
+          echo "CFBundleIconFile=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' \
+            "${app}/Contents/Info.plist")"
+
+          # Both architectures must ship a helper, or a download only works on one.
+          for name in aisshd aissh-mcp; do
+            for arch in aarch64 x86_64; do
+              helper="${app}/Contents/Resources/binaries/${name}-${arch}-apple-darwin"
+              test -f "${helper}" || { echo "missing helper ${helper}" >&2; exit 1; }
+            done
+          done
+          file "${app}/Contents/Resources/binaries/"*
+
+          # Exactly the four helpers, so nothing stray ships inside the app.
+          count=$(find "${app}/Contents/Resources/binaries" -type f | wc -l | tr -d ' ')
+          if [ "${count}" -ne 4 ]; then
+            echo "expected 4 bundled helpers, found ${count}:" >&2
+            ls -a "${app}/Contents/Resources/binaries" >&2
+            exit 1
+          fi
+
+          # One download has to run on both architectures. The executable is
+          # named by the bundle, not assumed, so read CFBundleExecutable.
+          executable="${app}/Contents/MacOS/$(/usr/libexec/PlistBuddy \
+            -c 'Print :CFBundleExecutable' "${app}/Contents/Info.plist")"
+          test -f "${executable}" || { echo "no such executable ${executable}" >&2; exit 1; }
+          archs=$(lipo -archs "${executable}")
+          echo "app architectures: ${archs}"
+          case "${archs}" in
+            *arm64*) ;;
+            *) echo "the app binary is not arm64: ${archs}" >&2; exit 1 ;;
+          esac
+          case "${archs}" in
+            *x86_64*) ;;
+            *) echo "the app binary is not x86_64: ${archs}" >&2; exit 1 ;;
+          esac
+
+      - name: Archive the app
+        working-directory: apps/desktop
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -eu
+          app="../../target/universal-apple-darwin/release/bundle/macos/AI SSH.app"
+          # ditto preserves a bundle's structure and permissions; zipping the
+          # directory does not.
+          ditto -c -k --sequesterRsrc --keepParent "${app}" "AI-SSH-${TAG}.zip"
+          shasum -a 256 "AI-SSH-${TAG}.zip" | tee "AI-SSH-${TAG}.zip.sha256"
+
+      - name: Package and verify the updater artifacts
+        working-directory: apps/desktop
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -eu
+          bundle="../../target/universal-apple-darwin/release/bundle/macos"
+          tarball=$(ls "${bundle}"/*.app.tar.gz)
+          test -f "${tarball}.sig" ||
+            { echo "no updater signature next to ${tarball}" >&2; exit 1; }
+
+          # The updater downloads the asset this manifest names, and a space in an
+          # asset name is rewritten by GitHub on some download URLs, so publish
+          # under a URL-safe copy. The bytes are unchanged, so the signature over
+          # them still applies.
+          asset="AI-SSH-${TAG}-universal.app.tar.gz"
+          cp "${tarball}" "${asset}"
+          cp "${tarball}.sig" "${asset}.sig"
+
+          python3 ../../scripts/generate-update-manifest.py \
+            --version "${TAG#v}" \
+            --tag "${TAG}" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --archive "${asset}" \
+            --signature "${asset}.sig" \
+            --output latest.json
+
+          # Check the manifest against the updater's own schema, and the archive
+          # against the public key compiled into the app, before publishing either.
+          # Absolute paths, because a cargo test process runs from the package
+          # directory rather than from this one.
+          AISSH_UPDATE_MANIFEST="${PWD}/latest.json" \
+          AISSH_UPDATE_ARCHIVE="${PWD}/${asset}" \
+          AISSH_UPDATE_SIGNATURE="${PWD}/${asset}.sig" \
+            cargo test -p ai-ssh-desktop --test update_release
+
+      - name: Upload the release files
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-app
+          path: |
+            apps/desktop/AI-SSH-*.zip
+            apps/desktop/AI-SSH-*.zip.sha256
+            apps/desktop/AI-SSH-*-universal.app.tar.gz
+            apps/desktop/AI-SSH-*-universal.app.tar.gz.sig
+            apps/desktop/latest.json
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish the release
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-app
+          path: dist
+
+      - name: List the release files
+        run: ls -la dist
+
+      - name: Build the release notes
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -eu
+          version="${TAG#v}"
+          previous=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)
+          if [ -z "${previous}" ]; then
+            previous=""
+          fi
+
+          cat > notes.md <<EOF
+          ## AI SSH ${version}
+
+          A macOS menu bar app plus the \`aisshd\` daemon and \`aissh-mcp\` MCP server it installs.
+          This build is universal: it runs natively on Apple silicon and Intel.
+
+          ### Install
+
+          1. Unzip \`AI-SSH-${TAG}.zip\` and move \`AI SSH.app\` to \`/Applications\`.
+          2. This release is **not signed or notarized**, so macOS blocks the first launch.
+             Open it once with **Control-click > Open**, or clear the quarantine flag:
+
+             \`\`\`sh
+             xattr -dr com.apple.quarantine "/Applications/AI SSH.app"
+             \`\`\`
+
+          3. Approve the dialog that starts \`aisshd\`, then add a target to
+             \`~/.aissh/config.toml\`. Credentials live there in plaintext at mode 0600.
+          4. Point an MCP client at \`~/.aissh/bin/aissh-mcp\`.
+
+          The app reinstalls \`~/.aissh/bin/aisshd\` and \`~/.aissh/bin/aissh-mcp\` on every
+          launch, so installing over an older version upgrades both.
+
+          ### Updating
+
+          This build updates itself: it checks for a new release shortly after launch
+          and asks before downloading. An update is only installed if its signature
+          matches the public key compiled into the app, so a tampered download is
+          refused. Builds released before the updater existed have to be replaced by
+          hand once; after that they update in place.
+
+          ### Verifying the download
+
+          \`\`\`sh
+          shasum -a 256 -c AI-SSH-${TAG}.zip.sha256
+          \`\`\`
+          EOF
+
+          if [ -n "${previous}" ]; then
+            {
+              echo
+              echo "### Changes since ${previous}"
+              echo
+              git log --no-merges --pretty='- %s (%h)' "${previous}..${TAG}"
+            } >> notes.md
+          else
+            {
+              echo
+              echo "### Changes"
+              echo
+              git log --no-merges --pretty='- %s (%h)' "${TAG}"
+            } >> notes.md
+          fi
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -eu
+          # --verify-tag refuses to invent a tag that was never pushed.
+          # latest.json is what an installed app polls at
+          # releases/latest/download/latest.json, and the .app.tar.gz is what it
+          # installs after checking the signature over those bytes.
+          gh release create "${TAG}" \
+            --title "AI SSH ${TAG#v}" \
+            --notes-file notes.md \
+            --verify-tag \
+            dist/AI-SSH-*.zip \
+            dist/AI-SSH-*.zip.sha256 \
+            dist/AI-SSH-*-universal.app.tar.gz \
+            dist/AI-SSH-*-universal.app.tar.gz.sig \
+            dist/latest.json

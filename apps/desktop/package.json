@@ -7,7 +7,8 @@
     "prepare:helpers": "node scripts/prepare-helpers.mjs",
     "dev": "vite --port 1420",
     "build": "tsc && vite build",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "icons": "tauri icon src-tauri/icons/icon.svg && rm -rf src-tauri/icons/android src-tauri/icons/ios src-tauri/icons/Square*Logo.png src-tauri/icons/StoreLogo.png"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",

@@ -1,0 +1,14 @@
+{
+  "version": "0.2.0",
+  "pub_date": "2026-09-15T06:50:37Z",
+  "platforms": {
+    "darwin-aarch64": {
+      "url": "https://github.com/j7ur8/AI_SSH/releases/download/v0.2.0/AI-SSH-v0.2.0-universal.app.tar.gz",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWmhFRXkrQjJwN1hGeC9YTkFnQzV6UlIycHJKNVh3VnZpOHdjbUNFSzcxaHZOTnhHVlRZazd5eW1ZQTg4aXJnTnN3TUtrNDhydE5HK0lCdEhnOWtNYWt4UTIxNy9mTUEwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5NDU0OTE2CWZpbGU6QUkgU1NILmFwcC50YXIuZ3oKc2I1WEQ2U1AvWmtCMWtpbjQ2WFFiUjZwWFZpT24xMUw0Mk8xcWZra2x0MEtCTDlMQjNiekFzVTMrVHhKMkY4SktTYXhPeHVYa0pXb25zU3NuZUI4Q0E9PQo="
+    },
+    "darwin-x86_64": {
+      "url": "https://github.com/j7ur8/AI_SSH/releases/download/v0.2.0/AI-SSH-v0.2.0-universal.app.tar.gz",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWmhFRXkrQjJwN1hGeC9YTkFnQzV6UlIycHJKNVh3VnZpOHdjbUNFSzcxaHZOTnhHVlRZazd5eW1ZQTg4aXJnTnN3TUtrNDhydE5HK0lCdEhnOWtNYWt4UTIxNy9mTUEwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5NDU0OTE2CWZpbGU6QUkgU1NILmFwcC50YXIuZ3oKc2I1WEQ2U1AvWmtCMWtpbjQ2WFFiUjZwWFZpT24xMUw0Mk8xcWZra2x0MEtCTDlMQjNiekFzVTMrVHhKMkY4SktTYXhPeHVYa0pXb25zU3NuZUI4Q0E9PQo="
+    }
+  }
+}

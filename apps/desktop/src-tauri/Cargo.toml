@@ -18,7 +18,13 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-autostart = "2.5"
 tauri-plugin-dialog = "2.7"
 tokio.workspace = true
+tauri-plugin-updater = "2.11.0"
+serde_json.workspace = true
 
 [[bin]]
 name = "ai-ssh-desktop"
 path = "src/main.rs"
+
+[dev-dependencies]
+base64.workspace = true
+minisign-verify = "0.2.5"

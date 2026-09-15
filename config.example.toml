@@ -4,6 +4,9 @@ idle_timeout_seconds = 1800
 connect_timeout_seconds = 15
 keepalive_seconds = 30
 recording_limit_mib = 500
+# A session whose SSH transport dropped is reconnected on the next command.
+reconnect_attempts = 1
+reconnect_backoff_seconds = 2
 quit_daemon_on_app_exit = false
 launch_at_login = false
 

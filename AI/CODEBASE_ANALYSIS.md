@@ -57,11 +57,13 @@ Sensitive fields are password, private-key passphrase, private-key file contents
 
 ## Public Interfaces
 
-The MCP server publishes 14 tools: target/session listing, session create/status/close, foreground/background exec, command poll/cancel, and PTY open/write/read/resize/close. The daemon additionally exposes handshake, config reload and shutdown requests to local native clients. The Tauri bridge exposes configuration, target test, session observation and native folder/window actions. The desktop uses one main Webview: its session page constrains scrolling to the left list, embeds the selected command transcript on the right, and accepts tray selections through a `select-session` event.
+The MCP server publishes 21 tools: target/session listing, session create/status/close, foreground/background exec, command poll/cancel/listing, PTY open/write/read/resize/close, and six SFTP file operations (stat/read/write/upload/download/mkdir). The daemon additionally exposes handshake, config reload and shutdown requests to local native clients. The Tauri bridge exposes configuration, target test, session observation and native folder/window actions. The desktop uses one main Webview: its session page constrains scrolling to the left list, embeds the selected command transcript on the right, and accepts tray selections through a `select-session` event.
 
 ## Error Handling And Configuration
 
-Daemon errors use `ErrorPayload { code, message, retryable }`. MCP tool failures are returned as successful JSON-RPC responses with `isError: true`. Configuration rejects unknown TOML fields, invalid settings, duplicate/empty targets, insecure file modes and private keys outside the managed keys directory.
+Daemon errors use `ErrorPayload { code, message, retryable }`. MCP tool failures are returned as successful JSON-RPC responses with `isError: true`. The daemon decides `retryable` and the MCP layer forwards it unchanged, so the two cannot drift.
+
+Stable codes beyond the original set: `SFTP_UNAVAILABLE`, `FILE_NOT_FOUND`, `FILE_EXISTS`, `PERMISSION_DENIED`, `LOCAL_IO_ERROR`, `REMOTE_IO_ERROR`, `REMOTE_COMMAND_FAILED`, `REMOTE_TIMEOUT`, `TRANSFER_VERIFY_FAILED`, `SESSION_CLOSED`. Configuration rejects unknown TOML fields, invalid settings, duplicate/empty targets, insecure file modes and private keys outside the managed keys directory.
 
 ## Test Strategy And Current Result
 
@@ -70,7 +72,7 @@ Daemon errors use `ErrorPayload { code, message, retryable }`. MCP tool failures
 - `npm run build`: passed; Vite warns that the main JavaScript chunk is over 500 kB.
 - `npm run tauri build -- --debug`: passed and produced a macOS application bundle; the packaged main window registered as a foreground application and appeared in the Dock while open.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: not run because the stable toolchain lacks the Clippy component.
-- MCP stdio and live-daemon probes: initialize/list/error shapes tested; installed helper exposes 14 tools and connects to daemon.
+- MCP stdio and live-daemon probes: initialize/list/error shapes tested; the helper exposes 21 tools and connects to the daemon.
 - Historical command poll: 519 stored events were delivered exactly once over 61 pages with monotonic cursors and terminal `poll_complete: true`.
 - Fresh remote exec/background/PTY end-to-end tests were not possible because the current configuration exposes zero targets.
 

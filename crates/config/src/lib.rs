@@ -91,6 +91,10 @@ pub struct Config {
     pub keepalive_seconds: u64,
     #[serde(default = "default_recording")]
     pub recording_limit_mib: u64,
+    #[serde(default = "default_reconnect_attempts")]
+    pub reconnect_attempts: u64,
+    #[serde(default = "default_reconnect_backoff")]
+    pub reconnect_backoff_seconds: u64,
     pub quit_daemon_on_app_exit: bool,
     pub launch_at_login: bool,
     #[serde(default)]
@@ -136,6 +140,12 @@ const fn default_keepalive() -> u64 {
 const fn default_recording() -> u64 {
     500
 }
+const fn default_reconnect_attempts() -> u64 {
+    1
+}
+const fn default_reconnect_backoff() -> u64 {
+    2
+}
 const fn default_port() -> u16 {
     22
 }
@@ -149,6 +159,8 @@ impl Config {
             connect_timeout_seconds: default_connect(),
             keepalive_seconds: default_keepalive(),
             recording_limit_mib: default_recording(),
+            reconnect_attempts: default_reconnect_attempts(),
+            reconnect_backoff_seconds: default_reconnect_backoff(),
             quit_daemon_on_app_exit: false,
             launch_at_login: false,
             targets: Vec::new(),
@@ -189,6 +201,12 @@ impl Config {
         }
         if self.recording_limit_mib == 0 {
             return Err(ConfigError::InvalidSetting("recording_limit_mib"));
+        }
+        if !(1..=10).contains(&self.reconnect_attempts) {
+            return Err(ConfigError::InvalidSetting("reconnect_attempts"));
+        }
+        if self.reconnect_backoff_seconds > 60 {
+            return Err(ConfigError::InvalidSetting("reconnect_backoff_seconds"));
         }
         let mut ids = HashSet::new();
         for target in &self.targets {
@@ -362,6 +380,8 @@ mod tests {
             connect_timeout_seconds: 25,
             keepalive_seconds: 45,
             recording_limit_mib: 750,
+            reconnect_attempts: 3,
+            reconnect_backoff_seconds: 5,
             quit_daemon_on_app_exit: true,
             launch_at_login: true,
             targets: vec![
@@ -396,6 +416,8 @@ mod tests {
         assert_eq!(loaded.connect_timeout_seconds, 25);
         assert_eq!(loaded.keepalive_seconds, 45);
         assert_eq!(loaded.recording_limit_mib, 750);
+        assert_eq!(loaded.reconnect_attempts, 3);
+        assert_eq!(loaded.reconnect_backoff_seconds, 5);
         assert!(loaded.quit_daemon_on_app_exit);
         assert!(loaded.launch_at_login);
         assert_eq!(loaded.targets.len(), 2);
@@ -415,6 +437,57 @@ mod tests {
             0o600
         );
         fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn accepts_a_config_written_before_reconnect_settings_existed() {
+        let root = std::env::temp_dir().join(format!(
+            "aissh-legacy-config-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = Paths::under(root);
+        paths.ensure().unwrap();
+        fs::write(
+            &paths.config,
+            concat!(
+                "version = 1\n",
+                "retention_days = 30\n",
+                "idle_timeout_seconds = 1800\n",
+                "connect_timeout_seconds = 15\n",
+                "keepalive_seconds = 30\n",
+                "recording_limit_mib = 500\n",
+                "quit_daemon_on_app_exit = false\n",
+                "launch_at_login = false\n",
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&paths.config, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let config = Config::load(&paths).unwrap();
+        assert_eq!(config.reconnect_attempts, 1);
+        assert_eq!(config.reconnect_backoff_seconds, 2);
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rejects_out_of_range_reconnect_settings() {
+        let mut config = Config::default_config();
+        config.reconnect_attempts = 0;
+        let paths = Paths::under(std::env::temp_dir().join("aissh-reconnect-range"));
+        assert!(matches!(
+            config.validate(&paths),
+            Err(ConfigError::InvalidSetting("reconnect_attempts"))
+        ));
+
+        let mut config = Config::default_config();
+        config.reconnect_backoff_seconds = 61;
+        assert!(matches!(
+            config.validate(&paths),
+            Err(ConfigError::InvalidSetting("reconnect_backoff_seconds"))
+        ));
     }
 
     fn aissh_target_summary(target: &Target) -> serde_json::Value {

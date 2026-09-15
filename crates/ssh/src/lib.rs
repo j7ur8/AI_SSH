@@ -11,6 +11,17 @@ use std::{
     time::Duration,
 };
 
+pub mod transfer;
+
+pub use russh_sftp::client::SftpSession;
+pub use transfer::{
+    RemoteHash, TransferOutcome, download_staged, hash_local_file, hex_digest, make_dir,
+    read_capped, sftp_error, stat, try_stat, upload_staged, write_staged,
+};
+
+/// How long the SFTP subsystem may take to complete its version handshake.
+const SFTP_INIT_TIMEOUT: Duration = Duration::from_secs(15);
+
 #[derive(Clone)]
 struct ClientHandler {
     fingerprint: Arc<Mutex<Option<String>>>,
@@ -103,10 +114,44 @@ impl SshConnection {
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
     }
+    /// True once the transport is gone. A handle in this state cannot serve any
+    /// further channel, so the session layer replaces it before the next call.
+    pub fn is_closed(&self) -> bool {
+        self.handle.is_closed()
+    }
     pub async fn open_exec(&self, command: &str) -> Result<ExecChannel> {
         let channel = self.handle.channel_open_session().await?;
         channel.exec(true, command.as_bytes()).await?;
         Ok(ExecChannel(channel))
+    }
+    /// Opens a real SFTP subsystem channel.
+    ///
+    /// A server with the subsystem disabled accepts the channel and then never
+    /// completes the protocol handshake, so the failure surfaces here as a
+    /// timeout mapped to `SFTP_UNAVAILABLE` rather than as a channel error.
+    pub async fn open_sftp(&self) -> Result<SftpSession> {
+        let channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .map_err(|error| anyhow!("SFTP_UNAVAILABLE: {error}"))?;
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(|error| anyhow!("SFTP_UNAVAILABLE: {error}"))?;
+        tokio::time::timeout(
+            SFTP_INIT_TIMEOUT,
+            SftpSession::new(channel.into_stream()),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!("SFTP_UNAVAILABLE: the server did not complete the SFTP handshake")
+        })?
+        .map_err(|error| {
+            anyhow!(
+                "SFTP_UNAVAILABLE: {error}; this server may have the sftp subsystem disabled - use ssh_exec_start instead"
+            )
+        })
     }
     pub async fn open_pty(
         &self,
@@ -176,6 +221,48 @@ impl ExecChannel {
     pub async fn cancel(&self) -> Result<()> {
         self.0.signal(russh::Sig::TERM).await?;
         Ok(())
+    }
+    /// Sends bytes to the remote command's stdin.
+    pub async fn write_all(&self, data: &[u8]) -> Result<()> {
+        self.0.data_bytes(data.to_vec()).await?;
+        Ok(())
+    }
+    /// Signals end of input so a stdin-consuming remote command can finish.
+    pub async fn eof(&self) -> Result<()> {
+        self.0.eof().await?;
+        Ok(())
+    }
+    /// Drains stdout, stderr, and the exit status.
+    ///
+    /// `limit` bounds the bytes retained so a runaway command cannot exhaust
+    /// memory; reaching it sets the returned `truncated` flag.
+    pub async fn collect(&mut self, limit: usize) -> Result<(Vec<u8>, Vec<u8>, Option<u32>, bool)> {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut exit = None;
+        let mut truncated = false;
+        while let Some(event) = self.next().await {
+            match event {
+                ChannelEvent::Data(data) => {
+                    if stdout.len() + data.len() > limit {
+                        truncated = true;
+                    } else {
+                        stdout.extend_from_slice(&data);
+                    }
+                }
+                ChannelEvent::ExtendedData(data) => {
+                    if stderr.len() + data.len() > limit {
+                        truncated = true;
+                    } else {
+                        stderr.extend_from_slice(&data);
+                    }
+                }
+                ChannelEvent::ExitStatus(code) => exit = Some(code),
+                ChannelEvent::Eof => {}
+                ChannelEvent::Close => break,
+            }
+        }
+        Ok((stdout, stderr, exit, truncated))
     }
 }
 
@@ -248,7 +335,11 @@ pub fn build_command(
     Ok(parts.join(" && "))
 }
 
-fn shell_quote(value: &str) -> String {
+/// Quotes a value for a single shell word.
+///
+/// Public because remote path arguments outside this crate (hashing, `sudo`
+/// reads and writes) must reach the shell quoted rather than interpolated.
+pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
@@ -313,5 +404,12 @@ mod tests {
         assert!(
             build_command("true", None, &BTreeMap::from([("A-B".into(), "x".into())])).is_err()
         );
+    }
+
+    #[test]
+    fn quotes_paths_for_a_single_shell_word() {
+        assert_eq!(shell_quote("/srv/app"), "'/srv/app'");
+        assert_eq!(shell_quote("/srv/it's here"), "'/srv/it'\\''s here'");
+        assert_eq!(shell_quote("/tmp/a b; rm -rf /"), "'/tmp/a b; rm -rf /'");
     }
 }

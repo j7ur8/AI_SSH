@@ -1,5 +1,6 @@
 use aissh_protocol::{
-    CommandInfo, CommandStatus, SessionInfo, SessionStatus, StreamKind, TerminalEvent,
+    CommandInfo, CommandStatus, CommandSummary, SessionInfo, SessionStatus, StreamKind,
+    TerminalEvent,
 };
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -79,8 +80,8 @@ impl Storage {
 
     pub fn insert_command(&self, command: &CommandInfo) -> Result<(), StorageError> {
         self.conn()?.execute(
-            "INSERT INTO commands (id,session_id,command,status,exit_code,started_at,finished_at,last_sequence,recording_truncated,recorded_bytes) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,0)",
-            params![command.id,command.session_id,command.command,enum_text(&command.status),command.exit_code,command.started_at.to_rfc3339(),command.finished_at.map(|v|v.to_rfc3339()),command.last_sequence,command.recording_truncated],
+            "INSERT INTO commands (id,session_id,command,status,exit_code,started_at,finished_at,last_sequence,recording_truncated,recorded_bytes) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![command.id,command.session_id,command.command,enum_text(&command.status),command.exit_code,command.started_at.to_rfc3339(),command.finished_at.map(|v|v.to_rfc3339()),command.last_sequence,command.recording_truncated,command.output_bytes],
         )?;
         Ok(())
     }
@@ -95,7 +96,7 @@ impl Storage {
 
     pub fn command(&self, id: &str) -> Result<Option<CommandInfo>, StorageError> {
         self.conn()?.query_row(
-            "SELECT id,session_id,command,status,exit_code,started_at,finished_at,last_sequence,recording_truncated FROM commands WHERE id=?1",
+            "SELECT id,session_id,command,status,exit_code,started_at,finished_at,last_sequence,recording_truncated,recorded_bytes FROM commands WHERE id=?1",
             [id],
             command_from_row,
         ).optional().map_err(Into::into)
@@ -106,10 +107,35 @@ impl Storage {
         session_id: &str,
     ) -> Result<Option<CommandInfo>, StorageError> {
         self.conn()?.query_row(
-            "SELECT id,session_id,command,status,exit_code,started_at,finished_at,last_sequence,recording_truncated FROM commands WHERE session_id=?1 ORDER BY started_at DESC LIMIT 1",
+            "SELECT id,session_id,command,status,exit_code,started_at,finished_at,last_sequence,recording_truncated,recorded_bytes FROM commands WHERE session_id=?1 ORDER BY started_at DESC LIMIT 1",
             [session_id],
             command_from_row,
         ).optional().map_err(Into::into)
+    }
+
+    /// Fleet-wide command listing ordered newest first. `session_id` narrows to
+    /// one session; `include_finished` adds terminal commands to the result.
+    pub fn commands(
+        &self,
+        session_id: Option<&str>,
+        include_finished: bool,
+        limit: usize,
+    ) -> Result<Vec<CommandSummary>, StorageError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id,session_id,command,status,exit_code,started_at,finished_at,last_sequence,recording_truncated,recorded_bytes FROM commands
+             WHERE (?1 IS NULL OR session_id=?1)
+               AND (?2 = 1 OR status='running')
+             ORDER BY started_at DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![session_id, include_finished as i64, limit as i64],
+            |row| {
+                let command = command_from_row(row)?;
+                Ok(summarize(command))
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn append_event(&self, event: &mut TerminalEvent) -> Result<(), StorageError> {
@@ -265,7 +291,29 @@ fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandInfo> {
         finished_at: row.get::<_, Option<String>>(6)?.map(parse_time),
         last_sequence: row.get(7)?,
         recording_truncated: row.get(8)?,
+        output_bytes: row.get(9)?,
     })
+}
+
+/// Projects a stored command into the fleet-listing shape. The live-only fields
+/// are left empty here and filled from the session runtime by the caller.
+fn summarize(command: CommandInfo) -> CommandSummary {
+    let running_for_seconds = (command.status == CommandStatus::Running)
+        .then(|| (Utc::now() - command.started_at).num_seconds().max(0) as u64);
+    CommandSummary {
+        command_preview: aissh_protocol::command_preview(&command.command),
+        id: command.id,
+        session_id: command.session_id,
+        status: command.status,
+        exit_code: command.exit_code,
+        started_at: command.started_at,
+        finished_at: command.finished_at,
+        last_sequence: command.last_sequence,
+        output_bytes: command.output_bytes,
+        recording_truncated: command.recording_truncated,
+        running_for_seconds,
+        seconds_since_last_output: None,
+    }
 }
 
 const SCHEMA: &str = r#"
@@ -279,12 +327,32 @@ CREATE INDEX IF NOT EXISTS events_session_sequence ON events(session_id,sequence
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn truncates_recording_at_limit() {
-        let store = Storage::open(Path::new(":memory:"), 0).unwrap();
+
+    fn with_command(
+        id: &str,
+        session_id: &str,
+        status: CommandStatus,
+        command: &str,
+    ) -> CommandInfo {
         let now = Utc::now();
-        let session = SessionInfo {
-            id: "s".into(),
+        CommandInfo {
+            id: id.into(),
+            session_id: session_id.into(),
+            command: command.into(),
+            status,
+            exit_code: None,
+            started_at: now,
+            finished_at: None,
+            last_sequence: 0,
+            recording_truncated: false,
+            output_bytes: 0,
+        }
+    }
+
+    fn with_session(id: &str) -> SessionInfo {
+        let now = Utc::now();
+        SessionInfo {
+            id: id.into(),
             target_id: "t".into(),
             target_name: "T".into(),
             purpose: "p".into(),
@@ -297,23 +365,17 @@ mod tests {
             created_at: now,
             updated_at: now,
             closed_at: None,
-        };
-        store.upsert_session(&session).unwrap();
-        let stored_session = store.session("s").unwrap().unwrap();
-        assert_eq!(stored_session.id, "s");
-        assert_eq!(stored_session.status, SessionStatus::Ready);
-        let command = CommandInfo {
-            id: "c".into(),
-            session_id: "s".into(),
-            command: "echo".into(),
-            status: CommandStatus::Running,
-            exit_code: None,
-            started_at: now,
-            finished_at: None,
-            last_sequence: 0,
-            recording_truncated: false,
-        };
-        store.insert_command(&command).unwrap();
+        }
+    }
+
+    #[test]
+    fn truncates_recording_at_limit() {
+        let store = Storage::open(Path::new(":memory:"), 0).unwrap();
+        let now = Utc::now();
+        store.upsert_session(&with_session("s")).unwrap();
+        store
+            .insert_command(&with_command("c", "s", CommandStatus::Running, "echo"))
+            .unwrap();
         assert_eq!(
             store.latest_command_for_session("s").unwrap().unwrap().id,
             "c"
@@ -333,37 +395,93 @@ mod tests {
     }
 
     #[test]
+    fn reports_recorded_output_bytes_on_a_command() {
+        let store = Storage::open(Path::new(":memory:"), 1).unwrap();
+        store.upsert_session(&with_session("s")).unwrap();
+        store
+            .insert_command(&with_command("c", "s", CommandStatus::Running, "build"))
+            .unwrap();
+        let mut event = TerminalEvent {
+            session_id: "s".into(),
+            command_id: Some("c".into()),
+            sequence: 1,
+            timestamp: Utc::now(),
+            stream: StreamKind::Stdout,
+            payload: b"partial output".to_vec(),
+            persisted: true,
+        };
+        store.append_event(&mut event).unwrap();
+        assert_eq!(store.command("c").unwrap().unwrap().output_bytes, 14);
+    }
+
+    #[test]
+    fn lists_only_running_commands_unless_history_is_requested() {
+        let store = Storage::open(Path::new(":memory:"), 1).unwrap();
+        store.upsert_session(&with_session("s")).unwrap();
+        store
+            .insert_command(&with_command(
+                "running",
+                "s",
+                CommandStatus::Running,
+                "sleep 900",
+            ))
+            .unwrap();
+        store
+            .insert_command(&with_command(
+                "done",
+                "s",
+                CommandStatus::Completed,
+                "docker compose build",
+            ))
+            .unwrap();
+
+        let live = store.commands(None, false, 50).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, "running");
+        assert_eq!(live[0].seconds_since_last_output, None);
+        assert!(live[0].running_for_seconds.is_some());
+
+        let all = store.commands(None, true, 50).unwrap();
+        assert_eq!(all.len(), 2);
+        let finished = all.iter().find(|item| item.id == "done").unwrap();
+        assert_eq!(finished.running_for_seconds, None);
+        assert_eq!(finished.command_preview, "docker compose build");
+
+        let scoped = store.commands(Some("s"), true, 50).unwrap();
+        assert_eq!(scoped.len(), 2);
+        assert!(store.commands(Some("other"), true, 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn caps_fleet_listing_by_limit() {
+        let store = Storage::open(Path::new(":memory:"), 1).unwrap();
+        store.upsert_session(&with_session("s")).unwrap();
+        for index in 0..5 {
+            store
+                .insert_command(&with_command(
+                    &format!("c{index}"),
+                    "s",
+                    CommandStatus::Running,
+                    "work",
+                ))
+                .unwrap();
+        }
+        assert_eq!(store.commands(None, false, 2).unwrap().len(), 2);
+    }
+
+    #[test]
     fn reports_more_when_event_count_reaches_page_limit() {
         let store = Storage::open(Path::new(":memory:"), 1).unwrap();
         let now = Utc::now();
-        let session = SessionInfo {
-            id: "s".into(),
-            target_id: "t".into(),
-            target_name: "T".into(),
-            purpose: "p".into(),
-            client_name: "c".into(),
-            status: SessionStatus::Ready,
-            current_command: None,
-            last_exit_code: None,
-            recording_truncated: false,
-            host_fingerprint: None,
-            created_at: now,
-            updated_at: now,
-            closed_at: None,
-        };
-        store.upsert_session(&session).unwrap();
-        let command = CommandInfo {
-            id: "c".into(),
-            session_id: "s".into(),
-            command: "many-events".into(),
-            status: CommandStatus::Running,
-            exit_code: None,
-            started_at: now,
-            finished_at: None,
-            last_sequence: 0,
-            recording_truncated: false,
-        };
-        store.insert_command(&command).unwrap();
+        store.upsert_session(&with_session("s")).unwrap();
+        store
+            .insert_command(&with_command(
+                "c",
+                "s",
+                CommandStatus::Running,
+                "many-events",
+            ))
+            .unwrap();
         for sequence in 1..=2050 {
             let mut event = TerminalEvent {
                 session_id: "s".into(),

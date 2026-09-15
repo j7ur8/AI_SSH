@@ -21,6 +21,8 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tokio::net::UnixStream;
 
+mod updates;
+
 struct AppState {
     paths: Paths,
     request_id: AtomicU64,
@@ -133,6 +135,8 @@ async fn session_events(
             session_id,
             after_sequence,
             max_bytes,
+            // The observer polls on a timer; it never blocks the daemon.
+            wait_seconds: 0,
         })
         .await
 }
@@ -250,21 +254,68 @@ async fn wait_for_daemon(paths: &Paths) -> bool {
     false
 }
 
-fn bundled_helper(app: &tauri::App, name: &str) -> Option<PathBuf> {
+/// Directory names a packaged app may keep its helpers in.
+fn helper_directories(app: &tauri::App) -> Vec<PathBuf> {
     let mut directories = Vec::new();
     if let Ok(resources) = app.path().resource_dir() {
         directories.push(resources.join("binaries"));
     }
     directories.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("binaries"));
+    directories
+}
 
-    let expected = format!("{name}-{}", env!("TAURI_ENV_TARGET_TRIPLE"));
-    for directory in directories {
-        let path = directory.join(&expected);
-        if path.is_file() {
-            return Some(path);
+/// Architectures this process could be running as, native first.
+///
+/// A universal binary is two slices with independent compilations, so each slice
+/// reports its own architecture and can pick the matching helper.
+fn runtime_arches() -> &'static [&'static str] {
+    if cfg!(target_arch = "aarch64") {
+        &["aarch64", "x86_64"]
+    } else {
+        &["x86_64", "aarch64"]
+    }
+}
+
+/// Candidate helper file names, most specific first.
+///
+/// A single-architecture build stages exactly the triple the Tauri CLI compiles
+/// into this binary. A universal build stages one helper per architecture, and a
+/// lipo'd helper is accepted too, so the packaged name is matched in that order
+/// before falling back to the other architecture.
+fn helper_candidates(name: &str) -> Vec<String> {
+    let mut candidates = vec![
+        format!("{name}-{}", env!("TAURI_ENV_TARGET_TRIPLE")),
+        format!("{name}-universal-apple-darwin"),
+    ];
+    for arch in runtime_arches() {
+        let candidate = format!("{name}-{arch}-apple-darwin");
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
         }
     }
-    None
+    candidates
+}
+
+fn bundled_helper(app: &tauri::App, name: &str) -> Result<PathBuf, String> {
+    let directories = helper_directories(app);
+    let candidates = helper_candidates(name);
+    for directory in &directories {
+        for candidate in &candidates {
+            let path = directory.join(candidate);
+            if path.is_file() {
+                return Ok(path);
+            }
+        }
+    }
+    Err(format!(
+        "bundled helper {name} was not found; looked for [{}] in [{}]",
+        candidates.join(", "),
+        directories
+            .iter()
+            .map(|directory| directory.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 fn install_helper(source: &Path, destination: &Path) -> AnyResult<()> {
@@ -288,10 +339,14 @@ fn install_helper(source: &Path, destination: &Path) -> AnyResult<()> {
 fn install_bundled_helpers(app: &tauri::App, paths: &Paths) -> AnyResult<()> {
     for name in ["aisshd", "aissh-mcp"] {
         let destination = paths.bin.join(name);
-        if let Some(source) = bundled_helper(app, name) {
-            install_helper(&source, &destination)?;
-        } else if !destination.exists() {
-            bail!("bundled helper {name} was not found");
+        match bundled_helper(app, name) {
+            Ok(source) => install_helper(&source, &destination)?,
+            // An older install keeps working when a build ships without helpers.
+            Err(reason) => {
+                if !destination.exists() {
+                    bail!("{reason}");
+                }
+            }
         }
     }
     Ok(())
@@ -379,6 +434,14 @@ fn tray_action_menu(app: &tauri::AppHandle) -> AnyResult<Menu<tauri::Wry>> {
         None::<&str>,
     )?;
     let separator = PredefinedMenuItem::separator(app)?;
+    let check_updates = IconMenuItem::with_id_and_native_icon(
+        app,
+        "check-updates",
+        "Check for Updates…",
+        true,
+        Some(NativeIcon::Refresh),
+        None::<&str>,
+    )?;
     let quit = IconMenuItem::with_id_and_native_icon(
         app,
         "quit",
@@ -389,6 +452,7 @@ fn tray_action_menu(app: &tauri::AppHandle) -> AnyResult<Menu<tauri::Wry>> {
     )?;
     menu.append(&show)?;
     menu.append(&separator)?;
+    menu.append(&check_updates)?;
     menu.append(&quit)?;
     Ok(menu)
 }
@@ -407,6 +471,8 @@ fn initialize_ui(app: &tauri::AppHandle, paths: &Paths, created_config: bool) ->
             let _ = show_session_in_main(app, session_id);
         } else if id == "history" {
             let _ = show_main_window(app);
+        } else if id == "check-updates" {
+            updates::spawn_manual_check(app.clone());
         } else if id == "quit" {
             app.exit(0)
         }
@@ -493,6 +559,9 @@ fn initialize_ui(app: &tauri::AppHandle, paths: &Paths, created_config: bool) ->
     if created_config || has_no_targets {
         show_main_window(app)?;
     }
+    // Spawned from here because this runs once per launch on every path, after
+    // the daemon question has been settled, and the check itself is delayed.
+    updates::spawn_startup_check(app.clone());
     Ok(())
 }
 
@@ -561,6 +630,7 @@ fn main() {
             None,
         ))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
@@ -671,6 +741,53 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_lookup_prefers_the_native_architecture() {
+        let candidates = helper_candidates("aisshd");
+        let native = runtime_arches()[0];
+        let foreign = runtime_arches()[1];
+
+        assert_eq!(
+            candidates[0],
+            format!("aisshd-{}", env!("TAURI_ENV_TARGET_TRIPLE")),
+            "a single-architecture build stages exactly the compiled triple"
+        );
+        assert!(
+            candidates.contains(&"aisshd-universal-apple-darwin".to_string()),
+            "a lipo'd helper must still be found: {candidates:?}"
+        );
+
+        let native_candidate = format!("aisshd-{native}-apple-darwin");
+        let foreign_candidate = format!("aisshd-{foreign}-apple-darwin");
+        let native_index = candidates.iter().position(|item| item == &native_candidate);
+        let foreign_index = candidates
+            .iter()
+            .position(|item| item == &foreign_candidate);
+        assert!(
+            native_index < foreign_index,
+            "a universal app carrying both helpers must pick the one matching this process: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn helper_candidates_never_repeat_a_name() {
+        for name in ["aisshd", "aissh-mcp"] {
+            let candidates = helper_candidates(name);
+            let mut unique = candidates.clone();
+            unique.sort();
+            unique.dedup();
+            assert_eq!(
+                unique.len(),
+                candidates.len(),
+                "duplicate candidates waste lookups: {candidates:?}"
+            );
+            assert!(
+                candidates.iter().all(|item| item.starts_with(name)),
+                "candidates must stay scoped to one helper: {candidates:?}"
+            );
+        }
+    }
 
     #[test]
     fn daemon_prompt_only_starts_after_approval() {

@@ -58,7 +58,14 @@ type TerminalEvent = {
   payload: number[];
 };
 
-type CommandStatus = "running" | "completed" | "failed" | "timed_out" | "cancelled";
+type CommandStatus =
+  | "running"
+  | "completed"
+  | "failed"
+  | "timed_out"
+  | "cancelled"
+  /** The transport dropped before an exit status arrived. */
+  | "interrupted";
 
 type SessionCommand = {
   id: string;
@@ -70,6 +77,7 @@ type SessionCommand = {
   finished_at: string | null;
   last_sequence: number;
   recording_truncated: boolean;
+  output_bytes: number;
 };
 
 type Auth =
@@ -108,6 +116,11 @@ type ResponseData =
         events: TerminalEvent[];
         next_sequence: number;
         has_more: boolean;
+        progress?: {
+          seconds_since_last_output: number | null;
+          timed_out: boolean;
+          waited_seconds: number;
+        };
       };
     };
 

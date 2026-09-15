@@ -1,0 +1,142 @@
+name: Tag
+
+# Bumps the version, commits it, creates an annotated tag and pushes it. The
+# push uses GITHUB_TOKEN, and GitHub deliberately does not let a token-triggered
+# push start another workflow, so this run invokes the release workflow directly
+# afterwards. Tagging locally and running `git push --tags` also works, because
+# the release workflow listens for tag pushes too.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without a leading v (for example 0.2.0)"
+        required: true
+        type: string
+      dry_run:
+        description: "Validate and report only; do not commit, tag or push"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tag
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: Bump, tag and push
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      tagged: ${{ steps.tag.outputs.tagged }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the release notes can be derived from the log.
+          fetch-depth: 0
+
+      - name: Require the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -eu
+          if [ "${GITHUB_REF_NAME}" != "${DEFAULT_BRANCH}" ]; then
+            echo "run this from ${DEFAULT_BRANCH}, not ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+
+      - name: Validate the requested version
+        env:
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          set -eu
+          case "${REQUESTED}" in
+            *[!0-9.]* | "" | .* | *.)
+              echo "version must be a plain X.Y.Z value, got \"${REQUESTED}\"" >&2
+              exit 1
+              ;;
+          esac
+          if [ "$(printf '%s' "${REQUESTED}" | awk -F. '{print NF}')" -ne 3 ]; then
+            echo "version must have exactly three dot-separated parts" >&2
+            exit 1
+          fi
+
+          current=$(scripts/bump-version.sh --print)
+          if [ "${REQUESTED}" = "${current}" ]; then
+            echo "already at ${REQUESTED}; nothing to tag" >&2
+            exit 1
+          fi
+          newest=$(printf '%s %s\n' "${REQUESTED}" "${current}" |
+            tr ' ' '\n' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
+          if [ "${newest}" != "${REQUESTED}" ]; then
+            echo "${REQUESTED} is not newer than the current ${current}" >&2
+            exit 1
+          fi
+          if git rev-parse --verify --quiet "refs/tags/v${REQUESTED}"; then
+            echo "tag v${REQUESTED} already exists" >&2
+            exit 1
+          fi
+          echo "Will release ${REQUESTED}, currently ${current}"
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+
+      - name: Run tests before tagging
+        run: cargo test --workspace --exclude ai-ssh-desktop --all-targets
+
+      - name: Apply the version bump
+        env:
+          REQUESTED: ${{ inputs.version }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -eu
+          scripts/bump-version.sh --set "${REQUESTED}"
+          scripts/bump-version.sh --check
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "dry run: these are the changes that would be committed"
+            git --no-pager diff --stat
+            git checkout -- .
+          fi
+
+      - name: Commit, tag and push
+        id: tag
+        env:
+          REQUESTED: ${{ inputs.version }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -eu
+          tag="v${REQUESTED}"
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "dry run: would create and push ${tag}"
+            echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+            echo "tagged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock apps/desktop/package.json apps/desktop/src-tauri/tauri.conf.json
+          git commit -m "release: ${tag}"
+          git tag -a "${tag}" -m "AI SSH ${tag}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git push origin "${tag}"
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "tagged=true" >> "$GITHUB_OUTPUT"
+          echo "Created and pushed ${tag}"
+
+  release:
+    name: Release
+    needs: tag
+    if: needs.tag.outputs.tagged == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.tag.outputs.tag }}
