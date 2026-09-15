@@ -12,7 +12,10 @@ fn main() {
     let binaries = std::path::Path::new("binaries");
     if !binaries.is_dir() {
         if let Err(error) = std::fs::create_dir_all(binaries) {
-            println!("cargo:warning=cannot create {}: {error}", binaries.display());
+            println!(
+                "cargo:warning=cannot create {}: {error}",
+                binaries.display()
+            );
         }
     }
 
