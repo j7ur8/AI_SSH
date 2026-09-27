@@ -367,6 +367,9 @@ mod tests {
         );
     }
 
+    /// The command is built for the remote host's POSIX shell, so running it
+    /// here is only possible where one exists.
+    #[cfg(unix)]
     #[test]
     fn executes_shell_builtins_and_compound_commands() {
         let env = BTreeMap::from([("LANG".into(), "C".into()), ("NAME".into(), "value".into())]);
@@ -383,6 +386,26 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"ok:unset");
+    }
+
+    /// The same command, checked as text where no local POSIX shell exists.
+    #[cfg(not(unix))]
+    #[test]
+    fn builds_a_posix_command_for_the_remote_shell() {
+        let env = BTreeMap::from([("LANG".into(), "C".into()), ("NAME".into(), "value".into())]);
+        let command = build_command(
+            "unset NAME; export RESULT=ok; printf '%s' \"$RESULT:${NAME-unset}\"",
+            None,
+            &env,
+        )
+        .unwrap();
+        // The remote shell is POSIX whatever this process runs on, so the
+        // compound command and its variable syntax have to survive verbatim.
+        assert!(command.contains("${NAME-unset}"), "{command}");
+        // The command travels as a single-quoted argument, so every quote inside
+        // it is escaped rather than closing the argument.
+        assert!(command.contains(r"'\''%s'\''"), "{command}");
+        assert!(!command.contains('\n'), "{command}");
     }
 
     #[test]

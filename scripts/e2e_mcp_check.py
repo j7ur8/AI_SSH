@@ -2,8 +2,8 @@
 """End-to-end acceptance test for the ai-ssh MCP surface.
 
 Runs the real `aisshd` daemon and the real `aissh-mcp` stdio server against a
-local SSH server, with HOME pointed at a throwaway directory so the operator's
-own ~/.aissh configuration and their real hosts are never touched.
+local SSH server, with AISSH_ROOT pointed at a throwaway directory so the
+operator's own ~/.aissh configuration and their real hosts are never touched.
 
 Usage:
     AISSH_TEST_SSH_PORT=... AISSH_TEST_SSH_KEY=/path/to/id python3 scripts/e2e_mcp_check.py
@@ -24,8 +24,10 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-AISSH_MCP = REPO / "target" / "debug" / "aissh-mcp"
-AISSH_D = REPO / "target" / "debug" / "aisshd"
+# Windows resolves a program by its extension, so the helper it runs is a .exe.
+EXE = ".exe" if os.name == "nt" else ""
+AISSH_MCP = REPO / "target" / "debug" / f"aissh-mcp{EXE}"
+AISSH_D = REPO / "target" / "debug" / f"aisshd{EXE}"
 
 checks = []
 
@@ -34,6 +36,24 @@ def check(label, condition, detail=""):
     checks.append((label, bool(condition), detail))
     status = "PASS" if condition else "FAIL"
     print(f"[{status}] {label}" + (f" -- {detail}" if detail and not condition else ""))
+
+
+def wait_for_daemon(daemon, endpoint):
+    """Waits until the daemon is reachable.
+
+    A Unix daemon publishes a socket file, so its arrival is observable. A Windows
+    daemon owns a pipe name, which has no filesystem presence: there the wait is a
+    grace period, and a daemon that never came up is reported by the first MCP
+    call or by the process having already exited.
+    """
+    if os.name == "nt":
+        time.sleep(2)
+        return daemon.poll() is None
+    for _ in range(100):
+        if endpoint.exists():
+            return True
+        time.sleep(0.1)
+    return False
 
 
 class McpClient:
@@ -126,6 +146,11 @@ def main():
     (aissh / "config.toml").chmod(0o600)
 
     env = dict(os.environ)
+    # AISSH_ROOT is what isolates the run. HOME is kept in step because the file
+    # tools expand `~` through the home directory, which on Unix is HOME; on
+    # Windows neither variable can redirect the profile, so AISSH_ROOT is the
+    # only knob that works there.
+    env["AISSH_ROOT"] = str(aissh)
     env["HOME"] = str(home)
     env["RUST_LOG"] = "warn"
 
@@ -136,12 +161,7 @@ def main():
         stderr=subprocess.PIPE,
         text=True,
     )
-    socket = aissh / "run" / "aisshd.sock"
-    for _ in range(100):
-        if socket.exists():
-            break
-        time.sleep(0.1)
-    else:
+    if not wait_for_daemon(daemon, aissh / "run" / "aisshd.sock"):
         print("daemon did not start:", daemon.stderr.read()[:2000])
         return 1
 

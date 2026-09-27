@@ -17,6 +17,14 @@
 //! Without them the manifest test falls back to the committed fixture, which
 //! still pins the schema, and the signature test reports that it was skipped.
 
+// The artifacts checked here are the macOS ones, because that is what a release
+// publishes; a Windows release would add its platform key to the manifest and
+// widen this gate to match. The gate also keeps the test binary startable on
+// Windows, where the desktop package pulls in WebView2Loader.dll through the
+// updater plugin and cargo stages that DLL beside the application binary rather
+// than beside test binaries.
+#![cfg(target_os = "macos")]
+
 use std::{fs, path::Path, path::PathBuf};
 
 /// Must match the `platforms` keys the generator writes.

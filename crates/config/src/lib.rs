@@ -3,20 +3,17 @@ use std::{
     collections::HashSet,
     fs,
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
+
+mod permissions;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("cannot determine the current user's home directory")]
     NoHome,
-    #[error("{path} must have permissions {expected:o}, found {actual:o}")]
-    InsecurePermissions {
-        path: PathBuf,
-        expected: u32,
-        actual: u32,
-    },
+    #[error("{path} must be accessible only to its owner: {detail}")]
+    InsecurePermissions { path: PathBuf, detail: String },
     #[error("private key must be located below {0}")]
     KeyOutsideDirectory(PathBuf),
     #[error("configuration I/O error: {0}")]
@@ -48,9 +45,17 @@ pub struct Paths {
 }
 
 impl Paths {
+    /// The configuration root: `~/.aissh`, or the directory `AISSH_ROOT` names.
+    ///
+    /// The override exists because the home directory cannot be redirected on
+    /// Windows — `dirs` resolves it through the shell's known-folder API rather
+    /// than through `USERPROFILE` — so a test harness or a second install needs a
+    /// way to run beside the real one.
     pub fn discover() -> Result<Self, ConfigError> {
-        let root = dirs::home_dir().ok_or(ConfigError::NoHome)?.join(".aissh");
-        Ok(Self::under(root))
+        if let Some(root) = std::env::var_os("AISSH_ROOT").filter(|root| !root.is_empty()) {
+            return Ok(Self::under(PathBuf::from(root)));
+        }
+        Ok(Self::under(home_directory()?.join(".aissh")))
     }
 
     pub fn under(root: PathBuf) -> Self {
@@ -71,10 +76,49 @@ impl Paths {
     pub fn ensure(&self) -> Result<(), ConfigError> {
         for path in [&self.root, &self.keys, &self.data, &self.run, &self.bin] {
             fs::create_dir_all(path)?;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+            permissions::restrict(path, 0o700)?;
         }
         Ok(())
     }
+
+    /// The endpoint the daemon listens on and its clients connect to.
+    ///
+    /// Unix uses the socket file under the configuration root. Windows uses a
+    /// named pipe whose name is derived from that same root, so two roots — a
+    /// test harness and the real one, say — never contend for one endpoint.
+    pub fn endpoint(&self) -> PathBuf {
+        #[cfg(unix)]
+        {
+            self.socket.clone()
+        }
+        #[cfg(windows)]
+        {
+            PathBuf::from(format!(r"\\.\pipe\aissh-{:016x}", endpoint_key(&self.root)))
+        }
+    }
+}
+
+/// A stable hash of the configuration root. It only has to be reproducible
+/// across the processes that derive the same endpoint from the same
+/// configuration, so FNV-1a is enough and keeps the dependency list short.
+#[cfg(windows)]
+fn endpoint_key(root: &Path) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in root.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// The current user's home directory.
+///
+/// Every part of the project that has to resolve `~` goes through here, because
+/// the answer is not reachable the same way on every platform: a Windows process
+/// carries `USERPROFILE` rather than `HOME`, and the shell's known-folder API is
+/// what actually names the profile directory.
+pub fn home_directory() -> Result<PathBuf, ConfigError> {
+    dirs::home_dir().ok_or(ConfigError::NoHome)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -177,7 +221,7 @@ impl Config {
     }
 
     pub fn load(paths: &Paths) -> Result<Self, ConfigError> {
-        require_mode(&paths.config, 0o600)?;
+        require_owner_only(&paths.config, 0o600)?;
         let config: Self = toml::from_str(&fs::read_to_string(&paths.config)?)?;
         config.validate(paths)?;
         Ok(config)
@@ -230,7 +274,7 @@ impl Config {
                 if !canonical.starts_with(&keys) {
                     return Err(ConfigError::KeyOutsideDirectory(keys));
                 }
-                require_mode(&canonical, 0o600)?;
+                require_owner_only(&canonical, 0o600)?;
             }
         }
         Ok(())
@@ -240,30 +284,26 @@ impl Config {
         paths.ensure()?;
         self.validate(paths)?;
         let temp = paths.root.join("config.toml.tmp");
+        // The restriction is applied before the credentials are written, so the
+        // plaintext never exists in a file another account could open.
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .mode(0o600)
             .open(&temp)?;
+        permissions::restrict(&temp, 0o600)?;
         file.write_all(toml::to_string_pretty(self)?.as_bytes())?;
         file.sync_all()?;
-        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))?;
         fs::rename(temp, &paths.config)?;
         Ok(())
     }
 }
 
-fn require_mode(path: &Path, expected: u32) -> Result<(), ConfigError> {
-    let actual = fs::metadata(path)?.permissions().mode() & 0o777;
-    if actual != expected {
-        return Err(ConfigError::InsecurePermissions {
-            path: path.to_path_buf(),
-            expected,
-            actual,
-        });
-    }
-    Ok(())
+fn require_owner_only(path: &Path, mode: u32) -> Result<(), ConfigError> {
+    permissions::check(path, mode).map_err(|detail| ConfigError::InsecurePermissions {
+        path: path.to_path_buf(),
+        detail,
+    })
 }
 
 #[cfg(test)]
@@ -271,8 +311,13 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// The guarantee is a file mode on Unix and a DACL on Windows, so the test
+    /// that loosens it differs by platform; both expect the same refusal.
+    #[cfg(unix)]
     #[test]
     fn refuses_world_readable_config() {
+        use std::os::unix::fs::PermissionsExt;
+
         let root = std::env::temp_dir().join(format!(
             "aissh-config-{}",
             SystemTime::now()
@@ -284,6 +329,32 @@ mod tests {
         paths.ensure().unwrap();
         fs::write(&paths.config, "version = 1\n").unwrap();
         fs::set_permissions(&paths.config, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            Config::load(&paths),
+            Err(ConfigError::InsecurePermissions { .. })
+        ));
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn refuses_a_config_every_account_can_read() {
+        let root = std::env::temp_dir().join(format!(
+            "aissh-config-acl-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = Paths::under(root);
+        paths.ensure().unwrap();
+        Config::default_config().save_atomic(&paths).unwrap();
+        // A file this crate wrote is accepted before it is tampered with, which
+        // is what makes the refusal below about the ACL rather than the reader.
+        assert!(Config::load(&paths).is_ok());
+
+        // WD is Everyone, the account a leaked password file would be readable by.
+        permissions::apply_sddl(&paths.config, "D:P(A;;FA;;;WD)").unwrap();
         assert!(matches!(
             Config::load(&paths),
             Err(ConfigError::InsecurePermissions { .. })
@@ -321,10 +392,7 @@ mod tests {
         assert!(!Config::ensure_exists(&paths).unwrap());
         let config = Config::load(&paths).unwrap();
         assert!(config.targets.is_empty());
-        assert_eq!(
-            fs::metadata(&paths.config).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        assert!(permissions::check(&paths.config, 0o600).is_ok());
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
@@ -351,7 +419,7 @@ mod tests {
             ),
         )
         .unwrap();
-        fs::set_permissions(&paths.config, fs::Permissions::from_mode(0o600)).unwrap();
+        permissions::restrict(&paths.config, 0o600).unwrap();
 
         let error = Config::load(&paths).unwrap_err().to_string();
         assert!(error.contains("missing field `quit_daemon_on_app_exit`"));
@@ -371,7 +439,7 @@ mod tests {
         paths.ensure().unwrap();
         let key = paths.keys.join("test-key");
         fs::write(&key, "test private key").unwrap();
-        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+        permissions::restrict(&key, 0o600).unwrap();
 
         let config = Config {
             version: 1,
@@ -432,10 +500,7 @@ mod tests {
                 if path == &PathBuf::from("test-key")
                     && passphrase.as_deref() == Some("key-secret")
         ));
-        assert_eq!(
-            fs::metadata(&paths.config).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        assert!(permissions::check(&paths.config, 0o600).is_ok());
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
@@ -464,7 +529,7 @@ mod tests {
             ),
         )
         .unwrap();
-        fs::set_permissions(&paths.config, fs::Permissions::from_mode(0o600)).unwrap();
+        permissions::restrict(&paths.config, 0o600).unwrap();
 
         let config = Config::load(&paths).unwrap();
         assert_eq!(config.reconnect_attempts, 1);

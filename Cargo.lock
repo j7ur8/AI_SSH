@@ -59,6 +59,7 @@ name = "ai-ssh-desktop"
 version = "0.2.0"
 dependencies = [
  "aissh-config",
+ "aissh-ipc",
  "aissh-protocol",
  "anyhow",
  "base64 0.22.1",
@@ -83,6 +84,16 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "toml 0.9.12+spec-1.1.0",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "aissh-ipc"
+version = "0.2.0"
+dependencies = [
+ "libc",
+ "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -90,6 +101,7 @@ name = "aissh-mcp"
 version = "0.2.0"
 dependencies = [
  "aissh-config",
+ "aissh-ipc",
  "aissh-protocol",
  "anyhow",
  "base64 0.22.1",
@@ -160,14 +172,15 @@ name = "aisshd"
 version = "0.2.0"
 dependencies = [
  "aissh-config",
+ "aissh-ipc",
  "aissh-protocol",
  "aissh-session",
  "aissh-storage",
  "anyhow",
- "libc",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

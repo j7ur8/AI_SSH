@@ -11,6 +11,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 anyhow.workspace = true
 aissh-config = { path = "../../../crates/config" }
+aissh-ipc = { path = "../../../crates/ipc" }
 aissh-protocol = { path = "../../../crates/protocol" }
 chrono.workspace = true
 serde.workspace = true

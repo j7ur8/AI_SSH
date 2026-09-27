@@ -19,5 +19,20 @@ fn main() {
         }
     }
 
+    // The Windows resource list also names WebView2Loader.dll, because
+    // `webview2-com-sys` links the loader dynamically under every toolchain but
+    // MSVC. `tauri-build` copies a real one next to the binary, and
+    // `scripts/prepare-helpers.mjs` stages that copy for the bundler. A plain
+    // `cargo build` runs neither, so an empty placeholder keeps the resource
+    // check satisfied; it is replaced before anything is bundled.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        let loader = std::path::Path::new("WebView2Loader.dll");
+        if !loader.is_file() {
+            if let Err(error) = std::fs::write(loader, []) {
+                println!("cargo:warning=cannot create {}: {error}", loader.display());
+            }
+        }
+    }
+
     tauri_build::build()
 }

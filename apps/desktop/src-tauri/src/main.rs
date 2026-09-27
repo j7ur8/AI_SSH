@@ -1,4 +1,10 @@
+// A release build is a Windows GUI application, so launching it from a shortcut
+// does not open a console window beside the tray icon. A debug build keeps the
+// console, which is where its log output and panics are readable.
+#![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
+
 use aissh_config::{Config, Paths};
+use aissh_ipc::Stream;
 use aissh_protocol::{
     PROTOCOL_VERSION, Request, RequestFrame, Response, ResponseData, read_frame, write_frame,
 };
@@ -6,20 +12,22 @@ use anyhow::{Context, Result as AnyResult, bail};
 use std::{
     collections::HashMap,
     fs,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::Duration,
 };
+#[cfg(not(target_os = "macos"))]
+use tauri::menu::MenuItem;
+#[cfg(target_os = "macos")]
+use tauri::menu::{IconMenuItem, NativeIcon};
 use tauri::{
     Emitter, Manager, WebviewUrl, WebviewWindowBuilder,
-    menu::{IconMenuItem, Menu, NativeIcon, PredefinedMenuItem},
+    menu::{Menu, PredefinedMenuItem},
     tray::TrayIconBuilder,
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
-use tokio::net::UnixStream;
 
 mod updates;
 
@@ -52,7 +60,7 @@ fn dispatch_daemon_prompt(approved: bool, start: impl FnOnce(), exit: impl FnOnc
 
 impl AppState {
     async fn call(&self, request: Request) -> Result<ResponseData, String> {
-        let mut stream = UnixStream::connect(&self.paths.socket)
+        let mut stream = Stream::connect(&self.paths.endpoint())
             .await
             .map_err(|e| format!("aisshd unavailable: {e}"))?;
         let handshake = self.request_id.fetch_add(1, Ordering::Relaxed);
@@ -201,26 +209,32 @@ async fn set_retention_days(
         .map_err(|e| e.to_string())?;
     state.call(Request::ReloadConfig).await
 }
-#[tauri::command]
-fn open_config(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    std::process::Command::new("open")
-        .arg(&state.paths.root)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| e.to_string())
-}
-#[tauri::command]
-fn open_keys(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    std::process::Command::new("open")
-        .arg(&state.paths.keys)
+/// Opens a directory in the platform's file manager.
+fn open_in_file_manager(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    let program = "explorer";
+    #[cfg(not(windows))]
+    let program = "open";
+
+    Command::new(program)
+        .arg(path)
         .spawn()
         .map(|_| ())
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn open_config(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    open_in_file_manager(&state.paths.root)
+}
+#[tauri::command]
+fn open_keys(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    open_in_file_manager(&state.paths.keys)
+}
+
 async fn daemon_ready(paths: &Paths) -> bool {
     let probe = async {
-        let mut stream = UnixStream::connect(&paths.socket).await.ok()?;
+        let mut stream = Stream::connect(&paths.endpoint()).await.ok()?;
         write_frame(
             &mut stream,
             &RequestFrame {
@@ -264,10 +278,22 @@ fn helper_directories(app: &tauri::App) -> Vec<PathBuf> {
     directories
 }
 
+/// The suffix a program carries on this platform. Windows resolves an executable
+/// by its extension, so both the staged and the installed helper need one.
+const EXECUTABLE_SUFFIX: &str = if cfg!(windows) { ".exe" } else { "" };
+
+/// The name a helper is installed under inside the configuration's `bin`
+/// directory.
+fn installed_helper_name(name: &str) -> String {
+    format!("{name}{EXECUTABLE_SUFFIX}")
+}
+
 /// Architectures this process could be running as, native first.
 ///
 /// A universal binary is two slices with independent compilations, so each slice
-/// reports its own architecture and can pick the matching helper.
+/// reports its own architecture and can pick the matching helper. Only macOS
+/// ships one.
+#[cfg(target_os = "macos")]
 fn runtime_arches() -> &'static [&'static str] {
     if cfg!(target_arch = "aarch64") {
         &["aarch64", "x86_64"]
@@ -279,21 +305,29 @@ fn runtime_arches() -> &'static [&'static str] {
 /// Candidate helper file names, most specific first.
 ///
 /// A single-architecture build stages exactly the triple the Tauri CLI compiles
-/// into this binary. A universal build stages one helper per architecture, and a
-/// lipo'd helper is accepted too, so the packaged name is matched in that order
-/// before falling back to the other architecture.
+/// into this binary. A universal macOS build additionally stages one helper per
+/// architecture, and a lipo'd helper is accepted too, so the packaged name is
+/// matched in that order before falling back to the other architecture.
 fn helper_candidates(name: &str) -> Vec<String> {
-    let mut candidates = vec![
-        format!("{name}-{}", env!("TAURI_ENV_TARGET_TRIPLE")),
-        format!("{name}-universal-apple-darwin"),
-    ];
-    for arch in runtime_arches() {
-        let candidate = format!("{name}-{arch}-apple-darwin");
-        if !candidates.contains(&candidate) {
-            candidates.push(candidate);
+    let native = format!(
+        "{name}-{}{EXECUTABLE_SUFFIX}",
+        env!("TAURI_ENV_TARGET_TRIPLE")
+    );
+    #[cfg(target_os = "macos")]
+    {
+        let mut candidates = vec![native, format!("{name}-universal-apple-darwin")];
+        for arch in runtime_arches() {
+            let candidate = format!("{name}-{arch}-apple-darwin");
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
         }
+        candidates
     }
-    candidates
+    #[cfg(not(target_os = "macos"))]
+    {
+        vec![native]
+    }
 }
 
 fn bundled_helper(app: &tauri::App, name: &str) -> Result<PathBuf, String> {
@@ -318,9 +352,97 @@ fn bundled_helper(app: &tauri::App, name: &str) -> Result<PathBuf, String> {
     ))
 }
 
+/// Gives an installed helper the mode Unix needs to execute it. Windows has no
+/// mode, and the helpers already live in a directory `Paths::ensure` restricted
+/// to the owner.
+#[cfg(unix)]
+fn restrict_helper(path: &Path) -> AnyResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_helper(_path: &Path) -> AnyResult<()> {
+    Ok(())
+}
+
+/// Moves `temp` into place over `destination`.
+#[cfg(not(windows))]
+fn replace_helper(temp: &Path, destination: &Path) -> AnyResult<()> {
+    // Renaming over the destination is atomic, so a reader never sees a partial
+    // helper.
+    fs::rename(temp, destination)?;
+    Ok(())
+}
+
+/// Windows refuses to overwrite a program that is currently running, but it does
+/// allow that program to be renamed out of the way, so the old helper is parked
+/// under a name of its own and removed once whichever process held it exits.
+#[cfg(windows)]
+fn replace_helper(temp: &Path, destination: &Path) -> AnyResult<()> {
+    let displaced = displaced_path(destination);
+    if destination.exists() {
+        fs::rename(destination, &displaced).with_context(|| {
+            format!(
+                "cannot move the previous helper {} aside",
+                destination.display()
+            )
+        })?;
+    }
+    fs::rename(temp, destination)?;
+    let _ = fs::remove_file(&displaced);
+    Ok(())
+}
+
+/// The name a superseded helper is parked under.
+///
+/// It carries the process id and a timestamp so that two replacements can never
+/// want the same name. A parked file that a running daemon still holds cannot be
+/// deleted, and moving the next helper onto a name that is already taken would
+/// fail the install instead of the delete.
+#[cfg(windows)]
+fn displaced_path(destination: &Path) -> PathBuf {
+    let name = destination
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    destination.with_file_name(format!("{name}.replaced-{}-{stamp}", std::process::id()))
+}
+
+/// Removes the helpers earlier replacements parked, which could not be deleted at
+/// the time because a running process still held them. Retried on every launch so
+/// the directory converges instead of accumulating them.
+#[cfg(windows)]
+fn sweep_displaced(destination: &Path) {
+    let (Some(directory), Some(name)) = (destination.parent(), destination.file_name()) else {
+        return;
+    };
+    let prefix = format!("{}.replaced-", name.to_string_lossy());
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn sweep_displaced(_destination: &Path) {}
+
 fn install_helper(source: &Path, destination: &Path) -> AnyResult<()> {
+    // A helper a previous run parked can only be removed once the process that
+    // held it has exited, so the sweep runs on every launch rather than only when
+    // the binary changes.
+    sweep_displaced(destination);
     if destination.exists() && fs::read(source)? == fs::read(destination)? {
-        fs::set_permissions(destination, fs::Permissions::from_mode(0o700))?;
+        restrict_helper(destination)?;
         return Ok(());
     }
     let temp = destination.with_extension("installing");
@@ -331,14 +453,14 @@ fn install_helper(source: &Path, destination: &Path) -> AnyResult<()> {
             temp.display()
         )
     })?;
-    fs::set_permissions(&temp, fs::Permissions::from_mode(0o700))?;
-    fs::rename(&temp, destination)?;
+    restrict_helper(&temp)?;
+    replace_helper(&temp, destination)?;
     Ok(())
 }
 
 fn install_bundled_helpers(app: &tauri::App, paths: &Paths) -> AnyResult<()> {
     for name in ["aisshd", "aissh-mcp"] {
-        let destination = paths.bin.join(name);
+        let destination = paths.bin.join(installed_helper_name(name));
         match bundled_helper(app, name) {
             Ok(source) => install_helper(&source, &destination)?,
             // An older install keeps working when a build ships without helpers.
@@ -353,7 +475,7 @@ fn install_bundled_helpers(app: &tauri::App, paths: &Paths) -> AnyResult<()> {
 }
 
 fn start_daemon(paths: &Paths) -> AnyResult<()> {
-    let executable = paths.bin.join("aisshd");
+    let executable = paths.bin.join(installed_helper_name("aisshd"));
     if !executable.exists() {
         bail!("daemon executable is missing at {}", executable.display());
     }
@@ -365,12 +487,22 @@ fn start_daemon(paths: &Paths) -> AnyResult<()> {
         .create(true)
         .append(true)
         .open(paths.data.join("aisshd.stderr.log"))?;
-    Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .context("cannot launch aisshd")?;
+        .stderr(Stdio::from(stderr));
+    // The app has no console of its own, so Windows would give this
+    // console-subsystem child one: a black window on the desktop for a daemon
+    // that reports through the log files opened above.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command.spawn().context("cannot launch aisshd")?;
     Ok(())
 }
 
@@ -409,9 +541,39 @@ fn show_session_in_main(app: &tauri::AppHandle, session_id: &str) -> AnyResult<(
     Ok(())
 }
 
-fn session_native_icon(status: &aissh_protocol::SessionStatus) -> NativeIcon {
+/// A tray entry that can carry a glyph beside its label.
+///
+/// macOS draws a native icon next to the item. The Windows tray menu is text
+/// only, so the same entry is a plain menu item there and a session's state stays
+/// in its label.
+#[cfg(target_os = "macos")]
+type TrayEntry = IconMenuItem<tauri::Wry>;
+#[cfg(not(target_os = "macos"))]
+type TrayEntry = MenuItem<tauri::Wry>;
+
+/// macOS names the quit accelerator with Command; other platforms use Control.
+const QUIT_ACCELERATOR: &str = if cfg!(target_os = "macos") {
+    "Cmd+Q"
+} else {
+    "Ctrl+Q"
+};
+
+/// The icon a fixed action entry carries, or nothing for a session entry, which
+/// carries its connection state instead.
+#[cfg(target_os = "macos")]
+fn action_glyph(id: &str) -> Option<NativeIcon> {
+    Some(match id {
+        "history" => NativeIcon::Home,
+        "check-updates" => NativeIcon::Refresh,
+        "quit" => NativeIcon::StopProgress,
+        _ => return None,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn status_glyph(status: Option<&aissh_protocol::SessionStatus>) -> Option<NativeIcon> {
     use aissh_protocol::SessionStatus;
-    match status {
+    Some(match status? {
         SessionStatus::Ready | SessionStatus::Idle => NativeIcon::StatusAvailable,
         SessionStatus::Connecting | SessionStatus::ExecRunning | SessionStatus::PtyOpen => {
             NativeIcon::StatusPartiallyAvailable
@@ -420,36 +582,52 @@ fn session_native_icon(status: &aissh_protocol::SessionStatus) -> NativeIcon {
         | SessionStatus::Interrupted
         | SessionStatus::Closed
         | SessionStatus::Failed => NativeIcon::StatusUnavailable,
+    })
+}
+
+fn tray_entry(
+    app: &tauri::AppHandle,
+    id: &str,
+    text: &str,
+    accelerator: Option<&str>,
+    status: Option<&aissh_protocol::SessionStatus>,
+) -> AnyResult<TrayEntry> {
+    #[cfg(target_os = "macos")]
+    {
+        Ok(IconMenuItem::with_id_and_native_icon(
+            app,
+            id,
+            text,
+            true,
+            action_glyph(id).or_else(|| status_glyph(status)),
+            accelerator,
+        )?)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = status;
+        Ok(MenuItem::with_id(app, id, text, true, accelerator)?)
+    }
+}
+
+/// Updates the glyph on an existing entry. Only macOS renders one.
+fn set_tray_status(entry: &TrayEntry, status: Option<&aissh_protocol::SessionStatus>) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = entry.set_native_icon(status_glyph(status));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (entry, status);
     }
 }
 
 fn tray_action_menu(app: &tauri::AppHandle) -> AnyResult<Menu<tauri::Wry>> {
     let menu = Menu::new(app)?;
-    let show = IconMenuItem::with_id_and_native_icon(
-        app,
-        "history",
-        "Open AI SSH",
-        true,
-        Some(NativeIcon::Home),
-        None::<&str>,
-    )?;
+    let show = tray_entry(app, "history", "Open AI SSH", None, None)?;
     let separator = PredefinedMenuItem::separator(app)?;
-    let check_updates = IconMenuItem::with_id_and_native_icon(
-        app,
-        "check-updates",
-        "Check for Updates…",
-        true,
-        Some(NativeIcon::Refresh),
-        None::<&str>,
-    )?;
-    let quit = IconMenuItem::with_id_and_native_icon(
-        app,
-        "quit",
-        "Quit AI SSH",
-        true,
-        Some(NativeIcon::StopProgress),
-        Some("Cmd+Q"),
-    )?;
+    let check_updates = tray_entry(app, "check-updates", "Check for Updates…", None, None)?;
+    let quit = tray_entry(app, "quit", "Quit AI SSH", Some(QUIT_ACCELERATOR), None)?;
     menu.append(&show)?;
     menu.append(&separator)?;
     menu.append(&check_updates)?;
@@ -484,7 +662,7 @@ fn initialize_ui(app: &tauri::AppHandle, paths: &Paths, created_config: bool) ->
     tauri::async_runtime::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         let mut displayed_ids = Vec::<String>::new();
-        let mut session_items = HashMap::<String, IconMenuItem<tauri::Wry>>::new();
+        let mut session_items = HashMap::<String, TrayEntry>::new();
         loop {
             ticker.tick().await;
             let Some(state) = handle.try_state::<AppState>() else {
@@ -518,16 +696,14 @@ fn initialize_ui(app: &tauri::AppHandle, paths: &Paths, created_config: bool) ->
                 }
                 session_items.clear();
                 for (index, session) in active.iter().enumerate() {
-                    let item = match IconMenuItem::with_id_and_native_icon(
+                    let Ok(item) = tray_entry(
                         &handle,
-                        format!("session:{}", session.id),
-                        session.target_name.clone(),
-                        true,
-                        Some(session_native_icon(&session.status)),
-                        None::<&str>,
-                    ) {
-                        Ok(item) => item,
-                        Err(_) => continue,
+                        &format!("session:{}", session.id),
+                        &session.target_name,
+                        None,
+                        Some(&session.status),
+                    ) else {
+                        continue;
                     };
                     if live_menu.insert(&item, index).is_ok() {
                         session_items.insert(session.id.clone(), item);
@@ -547,7 +723,7 @@ fn initialize_ui(app: &tauri::AppHandle, paths: &Paths, created_config: bool) ->
                 );
                 if let Some(item) = session_items.get(&session.id) {
                     let _ = item.set_text(title);
-                    let _ = item.set_native_icon(Some(session_native_icon(&session.status)));
+                    set_tray_status(item, Some(&session.status));
                 }
             }
         }
@@ -742,6 +918,9 @@ fn main() {
 mod tests {
     use super::*;
 
+    /// Only a macOS build stages more than one helper, so only there can the
+    /// ordering between them be observed.
+    #[cfg(target_os = "macos")]
     #[test]
     fn helper_lookup_prefers_the_native_architecture() {
         let candidates = helper_candidates("aisshd");
@@ -804,20 +983,91 @@ mod tests {
         assert!(exited.get());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn session_statuses_map_to_native_menu_icons() {
         use aissh_protocol::SessionStatus;
         assert_eq!(
-            session_native_icon(&SessionStatus::Ready),
-            NativeIcon::StatusAvailable
+            status_glyph(Some(&SessionStatus::Ready)),
+            Some(NativeIcon::StatusAvailable)
         );
         assert_eq!(
-            session_native_icon(&SessionStatus::ExecRunning),
-            NativeIcon::StatusPartiallyAvailable
+            status_glyph(Some(&SessionStatus::ExecRunning)),
+            Some(NativeIcon::StatusPartiallyAvailable)
         );
         assert_eq!(
-            session_native_icon(&SessionStatus::Failed),
-            NativeIcon::StatusUnavailable
+            status_glyph(Some(&SessionStatus::Failed)),
+            Some(NativeIcon::StatusUnavailable)
         );
+    }
+
+    /// Windows runs a program by name only when it carries the extension it
+    /// resolves executables by.
+    #[cfg(windows)]
+    #[test]
+    fn helpers_are_installed_under_a_name_windows_resolves() {
+        for name in ["aisshd", "aissh-mcp"] {
+            assert_eq!(installed_helper_name(name), format!("{name}.exe"));
+            assert!(
+                helper_candidates(name)
+                    .iter()
+                    .all(|candidate| candidate.ends_with(".exe")),
+                "a staged helper must keep the extension it was built with"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helpers_are_installed_without_an_extension() {
+        assert_eq!(installed_helper_name("aisshd"), "aisshd");
+        assert_eq!(installed_helper_name("aissh-mcp"), "aissh-mcp");
+    }
+
+    /// The parked name has to be unique, because a file a running daemon still
+    /// holds cannot be deleted and a second replacement must not fail trying to
+    /// take a name that is already in use.
+    #[cfg(windows)]
+    #[test]
+    fn a_parked_helper_has_a_name_of_its_own() {
+        let destination = Path::new(r"C:\config\bin\aisshd.exe");
+        let parked = displaced_path(destination);
+
+        assert_ne!(parked, destination);
+        assert_eq!(parked.parent(), destination.parent());
+        assert!(
+            parked
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("aisshd.exe.replaced-"),
+            "{}",
+            parked.display()
+        );
+    }
+
+    /// The sweep is what keeps parked helpers from accumulating across upgrades,
+    /// and it has to leave everything else in the directory alone.
+    #[cfg(windows)]
+    #[test]
+    fn a_launch_sweeps_the_helpers_earlier_launches_parked() {
+        let directory = std::env::temp_dir().join(format!("aissh-sweep-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let destination = directory.join("aisshd.exe");
+        fs::write(&destination, b"current").unwrap();
+        let parked = directory.join("aisshd.exe.replaced-1-2");
+        fs::write(&parked, b"superseded").unwrap();
+        let other_helper = directory.join("aissh-mcp.exe.replaced-1-2");
+        fs::write(&other_helper, b"another helper").unwrap();
+
+        sweep_displaced(&destination);
+
+        assert!(!parked.exists(), "a parked helper must be removed");
+        assert!(destination.exists(), "the installed helper must survive");
+        assert!(
+            other_helper.exists(),
+            "the sweep must only touch the helper it names"
+        );
+        fs::remove_dir_all(&directory).unwrap();
     }
 }

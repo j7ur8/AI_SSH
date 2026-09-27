@@ -4,6 +4,7 @@ members = [
   "apps/mcp-server",
   "apps/desktop/src-tauri",
   "crates/config",
+  "crates/ipc",
   "crates/protocol",
   "crates/session",
   "crates/ssh",

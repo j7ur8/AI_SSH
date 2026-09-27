@@ -1447,7 +1447,8 @@ fn session_not_found(id: &str) -> ErrorPayload {
 ///
 /// Absolute (or `~`-anchored) paths only: the daemon's own working directory is
 /// meaningless to a caller, so a relative path would resolve somewhere
-/// surprising.
+/// surprising. What counts as absolute is the platform's rule, so a caller on
+/// Windows names a drive or a UNC share rather than a bare `/path`.
 fn local_path_for(value: &str) -> ApiResult<PathBuf> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1456,12 +1457,16 @@ fn local_path_for(value: &str) -> ApiResult<PathBuf> {
             "local_path must not be empty",
         ));
     }
-    let path = if trimmed == "~" || trimmed.starts_with("~/") {
-        let home = std::env::var_os("HOME").ok_or_else(|| {
-            ErrorPayload::new("LOCAL_IO_ERROR", "cannot expand ~ because HOME is unset")
+    let path = if trimmed == "~" || trimmed.starts_with("~/") || trimmed.starts_with(r"~\") {
+        // The home directory is looked up the same way the configuration looks
+        // it up, because a Windows process has no HOME to read.
+        let home = aissh_config::home_directory().map_err(|error| {
+            ErrorPayload::new("LOCAL_IO_ERROR", format!("cannot expand ~: {error}"))
         })?;
-        let rest = trimmed.trim_start_matches('~').trim_start_matches('/');
-        PathBuf::from(home).join(rest)
+        let rest = trimmed
+            .trim_start_matches('~')
+            .trim_start_matches(['/', '\\']);
+        home.join(rest)
     } else {
         PathBuf::from(trimmed)
     };
@@ -1957,17 +1962,23 @@ mod tests {
         let error = local_path_for("relative/file").unwrap_err();
         assert_eq!(error.code, "INVALID_ARGUMENT");
         assert_eq!(local_path_for("").unwrap_err().code, "INVALID_ARGUMENT");
+        // A rooted path without a drive is absolute on Unix and not on Windows;
+        // each platform is exercised with the form it actually accepts.
+        #[cfg(unix)]
         assert_eq!(
             local_path_for("/tmp/out.tgz").unwrap(),
             PathBuf::from("/tmp/out.tgz")
         );
-        // HOME is set in any environment that can run these tests.
-        if let Some(home) = std::env::var_os("HOME") {
-            assert_eq!(
-                local_path_for("~/out.tgz").unwrap(),
-                PathBuf::from(home).join("out.tgz")
-            );
-        }
+        #[cfg(windows)]
+        assert_eq!(
+            local_path_for(r"C:\temp\out.tgz").unwrap(),
+            PathBuf::from(r"C:\temp\out.tgz")
+        );
+        let home = aissh_config::home_directory().unwrap();
+        assert_eq!(local_path_for("~/out.tgz").unwrap(), home.join("out.tgz"));
+        assert_eq!(local_path_for("~").unwrap(), home);
+        #[cfg(windows)]
+        assert_eq!(local_path_for(r"~\out.tgz").unwrap(), home.join("out.tgz"));
     }
 
     #[test]

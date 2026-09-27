@@ -461,12 +461,17 @@ mod tests {
 
     #[test]
     fn local_staged_path_stays_beside_the_target() {
-        let staged = local_staged_path(Path::new("/tmp/out/jobs.sqlite3"));
+        // Built with `join` rather than written out, because a path literal with
+        // `/` separators is not a local path on Windows.
+        let target = std::env::temp_dir().join("out").join("jobs.sqlite3");
+        let staged = local_staged_path(&target);
         assert_eq!(
-            parent_of(&staged.to_string_lossy()).as_deref(),
-            Some("/tmp/out")
+            staged.parent(),
+            target.parent(),
+            "a staged download must share the destination directory so the rename cannot cross filesystems"
         );
-        assert_ne!(staged, std::path::PathBuf::from("/tmp/out/jobs.sqlite3"));
+        assert_ne!(staged, target);
+        assert_ne!(staged.file_name(), target.file_name());
     }
 
     #[test]

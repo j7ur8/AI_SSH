@@ -21,7 +21,8 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+
+use aissh_ipc::Stream;
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static TEXT_DECODERS: OnceLock<Mutex<HashMap<String, DecoderState>>> = OnceLock::new();
@@ -198,12 +199,12 @@ async fn daemon_call(
     client_name: &str,
     request: Request,
 ) -> Result<ResponseData, CallError> {
-    let mut stream = UnixStream::connect(&paths.socket)
+    let mut stream = Stream::connect(&paths.endpoint())
         .await
         .with_context(|| {
             format!(
                 "cannot connect to {}; start aisshd first",
-                paths.socket.display()
+                paths.endpoint().display()
             )
         })
         .map_err(CallError::Transport)?;

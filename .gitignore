@@ -1,8 +1,10 @@
 /target
 /apps/desktop/node_modules
 /apps/desktop/dist
-# Staged by apps/desktop/scripts/prepare-helpers.mjs before every build.
+# Staged by apps/desktop/scripts/prepare-helpers.mjs before every build, or
+# created empty by build.rs so the resource path resolves.
 /apps/desktop/src-tauri/binaries/
+/apps/desktop/src-tauri/WebView2Loader.dll
 
 # Produced by the release workflow's packaging step.
 /apps/desktop/AI-SSH-*

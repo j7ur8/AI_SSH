@@ -45,6 +45,40 @@ jobs:
       - name: Build the helpers
         run: cargo build --release -p aisshd -p aissh-mcp
 
+  # The Windows half of the same checks. The named-pipe transport, the peer-SID
+  # check and the DACL-based owner-only enforcement are covered by the same test
+  # suite, so running it here is what keeps them working.
+  windows:
+    name: Rust checks (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+          rustc --version
+
+      # A C compiler and assembler for the crates that build C: `rusqlite` with
+      # the bundled SQLite, and `aws-lc-sys`.
+      - name: Install the C build tools
+        run: choco install nasm --no-progress -y
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --workspace --exclude ai-ssh-desktop --all-targets
+
+      - name: Build the helpers
+        run: cargo build --release -p aisshd -p aissh-mcp
+
+      # The desktop crate compiles on Windows even though this job builds no
+      # installer for it, so a Windows-only regression there still shows up.
+      - name: Type-check the desktop app
+        run: cargo check -p ai-ssh-desktop
+
   # The daemon and MCP server talk to a real sshd here. This is the job that
   # actually exercises SFTP transfers and remote digest verification, which unit
   # tests cannot cover.

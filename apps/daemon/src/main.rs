@@ -1,37 +1,69 @@
 use aissh_config::{Config, Paths};
+use aissh_ipc::{Listener, Stream};
 use aissh_protocol::{
     ErrorPayload, PROTOCOL_VERSION, Request, RequestFrame, Response, ResponseData, read_frame,
     write_frame,
 };
 use aissh_session::{SessionManager, events_response};
 use aissh_storage::Storage;
-use anyhow::{Context, Result, bail};
-use std::{os::unix::fs::PermissionsExt, path::Path, sync::Arc, time::Duration};
-use tokio::net::{UnixListener, UnixStream};
+use anyhow::{Context, Result};
+use std::{sync::Arc, time::Duration};
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
+/// Printed when the configuration cannot be read, which is nearly always because
+/// it is readable by more accounts than the one that owns it.
+const CONFIG_HINT: &str = if cfg!(windows) {
+    "copy config.example.toml and grant access only to your account"
+} else {
+    "copy config.example.toml and chmod 600"
+};
+
+/// Hides the console window Windows opens for a console program that is started
+/// outside a terminal, which is how a shortcut, a logon entry or a double-click
+/// starts this daemon.
+///
+/// Only a console this process is alone on was created for it and is therefore
+/// its to hide. A console shared with a shell is the window whoever ran the
+/// daemon from a terminal is reading, and hiding that would take their terminal
+/// away with it.
+#[cfg(windows)]
+fn hide_own_console() {
+    use windows_sys::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, ShowWindow};
+
+    let mut attached = [0u32; 4];
+    let processes = unsafe { GetConsoleProcessList(attached.as_mut_ptr(), attached.len() as u32) };
+    if processes != 1 {
+        return;
+    }
+    let window = unsafe { GetConsoleWindow() };
+    if !window.is_null() {
+        unsafe { ShowWindow(window, SW_HIDE) };
+    }
+}
+
+#[cfg(not(windows))]
+fn hide_own_console() {}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    hide_own_console();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .init();
     let paths = Paths::discover()?;
     Config::ensure_exists(&paths)?;
-    let config = Config::load(&paths).with_context(|| {
-        format!(
-            "cannot load {} (copy config.example.toml and chmod 600)",
-            paths.config.display()
-        )
-    })?;
-    let listener = bind_listener(&paths.socket).await?;
+    let config = Config::load(&paths)
+        .with_context(|| format!("cannot load {} ({CONFIG_HINT})", paths.config.display()))?;
+    let mut listener = Listener::bind(&paths.endpoint()).await?;
+    listener.harden()?;
     let storage = Arc::new(Storage::open(&paths.database, config.recording_limit_mib)?);
     storage.interrupt_unfinished()?;
     storage.cleanup(config.retention_days)?;
     let manager = SessionManager::new(config, paths.clone(), storage);
-    std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o600))?;
-    info!(socket=%paths.socket.display(),"aisshd is ready");
+    info!(endpoint=%listener.endpoint().display(),"aisshd is ready");
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let reaper = Arc::clone(&manager);
     tokio::spawn(async move {
@@ -49,8 +81,8 @@ async fn main() -> Result<()> {
                 }
             }
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
-                match same_user(&stream) {
+                let stream = accepted?;
+                match stream.same_user() {
                     Ok(true) => {
                         let manager = Arc::clone(&manager);
                         let shutdown = shutdown_tx.clone();
@@ -60,48 +92,19 @@ async fn main() -> Result<()> {
                             }
                         });
                     }
-                    Ok(false) => warn!("rejected IPC connection from another UID"),
+                    Ok(false) => warn!("rejected IPC connection from another user"),
                     Err(error) => error!(%error,"cannot inspect IPC peer"),
                 }
             }
         }
     }
-    drop(listener);
-    let _ = std::fs::remove_file(&paths.socket);
+    listener.cleanup();
     info!("aisshd stopped by local request");
     Ok(())
 }
 
-async fn bind_listener(path: &Path) -> Result<UnixListener> {
-    if path.exists() {
-        match UnixStream::connect(path).await {
-            Ok(_) => bail!("aisshd is already running at {}", path.display()),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-                ) =>
-            {
-                std::fs::remove_file(path)
-                    .with_context(|| format!("cannot remove stale socket {}", path.display()))?;
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("cannot inspect existing socket {}", path.display()));
-            }
-        }
-    }
-    UnixListener::bind(path)
-        .with_context(|| format!("cannot bind daemon socket {}", path.display()))
-}
-
-fn same_user(stream: &UnixStream) -> Result<bool> {
-    let peer = stream.peer_cred()?;
-    Ok(peer.uid() == unsafe { libc::geteuid() })
-}
-
 async fn serve_client(
-    mut stream: UnixStream,
+    mut stream: Stream,
     manager: Arc<SessionManager>,
     shutdown: watch::Sender<bool>,
 ) -> Result<()> {
@@ -348,30 +351,5 @@ async fn serve_client(
             let _ = shutdown.send(true);
             return Ok(());
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[tokio::test]
-    async fn refuses_to_replace_a_live_daemon_socket() {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!("aisshd-live-socket-{suffix}"));
-        std::fs::create_dir(&directory).unwrap();
-        let path = directory.join("aisshd.sock");
-        let listener = UnixListener::bind(&path).unwrap();
-
-        let error = bind_listener(&path).await.unwrap_err();
-        assert!(error.to_string().contains("already running"));
-
-        drop(listener);
-        std::fs::remove_file(&path).unwrap();
-        std::fs::remove_dir(&directory).unwrap();
     }
 }

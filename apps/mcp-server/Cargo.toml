@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 aissh-config = { path = "../../crates/config" }
+aissh-ipc = { path = "../../crates/ipc" }
 aissh-protocol = { path = "../../crates/protocol" }
 base64.workspace = true
 serde_json.workspace = true

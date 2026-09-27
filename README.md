@@ -1,21 +1,27 @@
 # AI SSH
 
-AI SSH is a macOS-only local SSH session service. AI clients use the `aissh-mcp` stdio server; the MCP process delegates all connection ownership to `aisshd` over a same-user Unix socket. The Tauri menubar app observes active and historical sessions without sending terminal input.
+AI SSH is a local SSH session service for macOS and Windows. AI clients use the `aissh-mcp` stdio server; the MCP process delegates all connection ownership to `aisshd` over a same-user local endpoint — a Unix socket on macOS, a named pipe on Windows. The Tauri desktop app observes active and historical sessions without sending terminal input.
 
 ## Security model
 
 - Host-key verification is deliberately disabled. The accepted SHA256 fingerprint is recorded and displayed.
 - Passwords and private-key passphrases are plaintext in `~/.aissh/config.toml`; recordings are plaintext SQLite data.
-- `config.toml` and private keys must be mode `0600`; directories are mode `0700`. Keys outside `~/.aissh/keys` are rejected.
+- `config.toml` and private keys must be readable only by their owner. Unix states that as mode `0600` and checks it; Windows states it as a DACL that grants access to nobody but that account, `SYSTEM` and `Administrators`, and reads the DACL back to check it. Directories are `0700`, or carry the same inheritable DACL so everything created inside inherits it. Keys outside `~/.aissh/keys` are rejected.
 - Login passwords are never returned through MCP and are never injected into `sudo` or other prompts.
-- The local socket is mode `0600` and the daemon additionally checks the peer UID.
+- The local endpoint is reachable only by the account that owns it. On Unix the socket is mode `0600` and the daemon compares the connecting peer's UID against its own. On Windows the pipe is created with `FILE_FLAG_FIRST_PIPE_INSTANCE`, so a second process cannot attach to the name a running daemon owns, and with `PIPE_REJECT_REMOTE_CLIENTS`, so no client can arrive over SMB; the daemon then compares the client's token user SID against its own and refuses a connection it cannot attribute.
 - `ssh_file_upload` and `ssh_file_download` read and write **local** paths on this machine at the MCP client's request. They require an absolute path (or `~`), and a download refuses to replace an existing file unless `overwrite` is set. This grants a same-UID MCP client nothing it could not already do for itself, but it is a deliberate widening of what the daemon touches and is stated here explicitly.
 - Update checks fetch a manifest from `github.com` over https; that is the only outbound request the app makes on its own. An update is installed only if a minisign signature matches the public key compiled into the app, and never without confirmation.
 - `ssh_file_write` and `ssh_file_read` accept `sudo: true`, which runs the privileged step through `sudo -n` over an exec channel. That only works when passwordless sudo is permitted for the login user; the login password is never supplied to it.
 
 ## Development
 
-Prerequisites are current stable Rust, Node.js 20+, Xcode command-line tools, and macOS 12+.
+Prerequisites are current stable Rust (1.85+) and Node.js 20+. On macOS that is Xcode command-line tools and macOS 12+. On Windows it is a C compiler for the crates that build C — either the MSVC toolchain or the GNU one with mingw-w64 — and WebView2, which Windows 10 and 11 already ship.
+
+MSVC is what the CI and the release use. The GNU toolchain also builds and runs the app, with two differences worth knowing about.
+
+`ld` reports `.rsrc merge failure: multiple non-default manifests` because it links a default manifest of its own next to the one `tauri-build` embeds. The merged resource keeps the common-controls and execution-level declarations, and DPI awareness is set at runtime by the windowing library rather than by the manifest, so a GNU build behaves like an MSVC one here.
+
+`WebView2Loader.dll` has to sit beside the executable under GNU, because `webview2-com-sys` links that loader statically under MSVC and dynamically everywhere else. The Windows bundle stages the copy `tauri-build` leaves next to the binary and lists it as a resource, so an installed GNU build starts without any extra setup; only a hand-copied executable would need the DLL placed beside it.
 
 ```sh
 cd apps/desktop
@@ -23,23 +29,27 @@ npm install
 npm run tauri dev
 ```
 
-`npm run tauri dev` builds the daemon and MCP helpers, starts the desktop app, and adds the AI SSH icon to the macOS menu bar. If `aisshd` is not already running, approve the native startup dialog. The app creates `~/.aissh/config.toml` automatically and opens the configuration window when no targets exist.
+`npm run tauri dev` builds the daemon and MCP helpers, starts the desktop app, and adds the AI SSH icon to the macOS menu bar or the Windows notification area. If `aisshd` is not already running, approve the native startup dialog. The app creates `~/.aissh/config.toml` automatically and opens the configuration window when no targets exist.
+
+On Windows, `~` is `%USERPROFILE%`, and the local endpoint is a named pipe rather than a socket file: the daemon logs it as `\\.\pipe\aissh-<hash>`, where the hash is derived from the configuration root so two roots never share one pipe.
 
 To build and open a standalone debug app:
 
 ```sh
 cd apps/desktop
 npm run tauri build -- --debug
-open "../../target/debug/bundle/macos/AI SSH.app"
+open "../../target/debug/bundle/macos/AI SSH.app"     # macOS
 ```
+
+On Windows the bundle is an installer under `target\debug\bundle\nsis\`, and the standalone debug app is `target\debug\ai-ssh-desktop.exe`.
 
 A local build produces the app but not the signed update archive. That is deliberate: enabling `createUpdaterArtifacts` in `tauri.conf.json` makes every `tauri build` require the private signing key, which only the release workflow holds. The release enables it with a `--config` override instead.
 
-After the app is running, click the AI SSH icon in the macOS menu bar and choose **Open AI SSH**. Quitting the configuration window does not stop the menubar app; use **Quit Menubar** from its menu to exit it.
+After the app is running, click the AI SSH icon in the macOS menu bar — or the notification area on Windows — and choose **Open AI SSH**. Quitting the configuration window does not stop the app; use **Quit AI SSH** to exit it.
 
-Targets and credentials can be edited in the app's **Configuration** tab. Private keys must be placed in `~/.aissh/keys` with mode `0600`.
+Targets and credentials can be edited in the app's **Configuration** tab. Private keys must be placed in `~/.aissh/keys` with mode `0600`, or on Windows with an ACL only your account can read. Copying a key into that directory is enough there, because the directory carries an inheritable owner-only DACL.
 
-The legacy `scripts/install-local.sh` command installs `aisshd` as a login LaunchAgent. It is not required for normal desktop development because the app installs and starts its bundled helper automatically.
+The legacy `scripts/install-local.sh` command installs `aisshd` as a login LaunchAgent on macOS. `scripts/install-local.ps1` is its Windows counterpart and adds a logon entry under the current user. Neither is required for normal desktop development because the app installs and starts its bundled helper automatically.
 
 `aissh-mcp` and `aisshd` are versioned together: both exchange protocol version 3, and a mismatch is refused with `PROTOCOL_MISMATCH` rather than half-working. After rebuilding, reinstall both helpers in `~/.aissh/bin` and restart the daemon (and rebuild the desktop app, which bundles its own copies).
 
@@ -54,6 +64,8 @@ Configure an MCP client with the stable executable path:
   }
 }
 ```
+
+On Windows the same path is `C:\Users\YOUR_USER\.aissh\bin\aissh-mcp.exe`.
 
 Ordinary commands should use `ssh_exec_start` followed by `ssh_command_poll`. The command runs through `/bin/sh -c`, so shell builtins, pipelines, redirections, and compound scripts are supported. PTY tools are reserved for interactive prompts, persistent shell state, and full-screen terminal programs. A logical session permits only one foreground exec or PTY at a time.
 
@@ -105,11 +117,12 @@ Long-running non-interactive work can use `ssh_exec_background`. It returns the 
 
 ## Workspace
 
-- `apps/daemon`: daemon, Unix socket server, lifecycle tasks
+- `apps/daemon`: daemon, local endpoint server (Unix socket or named pipe), lifecycle tasks
 - `apps/mcp-server`: MCP JSON-RPC stdio adapter
 - `apps/desktop`: Tauri 2 tray and React/xterm.js observer
 - `crates/protocol`: versioned MessagePack IPC contract
-- `crates/config`: versioned TOML and permission enforcement
+- `crates/ipc`: the local transport, and the peer-identity check that goes with it
+- `crates/config`: versioned TOML and owner-only enforcement (mode bits or a DACL)
 - `crates/ssh`: `russh` authentication, exec and PTY channels, SFTP subsystem, and the staged/verified transfer engine
 - `crates/session`: concurrency, timeout, cancellation, and idle state
 - `crates/storage`: SQLite WAL history, retention, and recording caps
@@ -126,7 +139,7 @@ npm run icons
 That writes every size plus `icon.icns` and `icon.ico` into `src-tauri/icons`. Two things about the set are deliberate:
 
 - `bundle.icon` lists `icons/128x128.png` first. Tauri derives the window and menu bar tray icon from the first `.png` in that list, and it embeds the decoded pixels in the binary, so a 128px source is crisp where it matters without carrying a megabyte of unused pixels.
-- The Android and iOS outputs and the Windows Store logos that `tauri icon` can emit are not committed. This is a macOS-only app; the script deletes them so re-running it leaves a clean tree.
+- The Android and iOS outputs and the Windows Store logos that `tauri icon` can emit are not committed. The app ships a macOS bundle and a Windows installer, never a store package, so the script deletes them and re-running it leaves a clean tree.
 
 Re-running `npm run icons` rewrites `icon.icns` even when the artwork has not changed: the writer emits its image elements in a non-deterministic order, so the bytes differ while every embedded image is identical. Commit that file when the design changes, not on every regeneration.
 
@@ -137,6 +150,8 @@ The app checks for a new release shortly after launch, and asks before installin
 Installing downloads the update archive, verifies a minisign signature over those exact bytes, replaces the app bundle and restarts the app. The `aisshd` daemon and any SSH session it owns are separate processes, so a restart does not interrupt them.
 
 The signature is independent of Apple code signing: it is what makes a download tamper-proof, and it is the reason the app can update itself while releases remain unsigned. The public key lives in `apps/desktop/src-tauri/tauri.conf.json`; the private key and its password are repository secrets used only when building a release.
+
+The release workflow builds the macOS bundle only, so `latest.json` carries `darwin-*` entries and nothing else. A Windows build therefore finds no update to offer, and its **Check for Updates…** reports that it is up to date. Shipping Windows updates means publishing a Windows installer, its signature, and a `windows-x86_64` entry in the same manifest.
 
 ```
 TAURI_SIGNING_PRIVATE_KEY           contents of ~/.tauri/ai-ssh-updater.key

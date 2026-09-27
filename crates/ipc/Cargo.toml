@@ -1,20 +1,19 @@
 [package]
-name = "aissh-config"
+name = "aissh-ipc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-dirs.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
-toml.workspace = true
+tokio.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Security",
-  "Win32_Security_Authorization",
+  "Win32_System_Pipes",
   "Win32_System_Threading",
 ] }
